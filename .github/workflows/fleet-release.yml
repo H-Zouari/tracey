@@ -1,0 +1,27 @@
+name: Fleet release
+
+on:
+  push:
+    tags: ["fleet-r*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - run: cargo build --release --locked -p tracey --no-default-features
+      - run: |
+          mkdir dist
+          cp target/release/tracey dist/tracey-x86_64-linux
+          strip dist/tracey-x86_64-linux
+          cd dist && sha256sum tracey-x86_64-linux > tracey-x86_64-linux.sha256
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --title "$GITHUB_REF_NAME"
+          --notes "tracey at $GITHUB_SHA for x86_64 Linux, built without the dashboard, search and Typst features."
