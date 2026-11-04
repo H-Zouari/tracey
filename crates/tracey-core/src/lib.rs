@@ -15,6 +15,8 @@ pub mod spec;
 
 #[cfg(feature = "reverse")]
 pub mod code_units;
+#[cfg(feature = "reverse")]
+mod injections;
 
 pub use coverage::CoverageReport;
 pub use languages::{arborium_for_ext, devicon_for_ext};

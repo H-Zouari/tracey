@@ -24,6 +24,7 @@ pub struct Lang {
     pub grammar: fn() -> arborium_tree_sitter::LanguageFn,
     /// Structural extraction (functions, types, etc.) for reverse coverage.
     pub extract: fn(&Path, &str) -> CodeUnits,
+    pub injections: Option<&'static str>,
 }
 
 /// Look up the language registered for a file extension.
@@ -63,6 +64,9 @@ macro_rules! __opt {
     ($v:literal) => {
         Some($v)
     };
+    ($v:path) => {
+        Some($v)
+    };
 }
 
 /// Expands a single declarative table into:
@@ -75,6 +79,7 @@ macro_rules! define_languages {
             [$($ext:literal),+ $(,)?] => $grammar:path, $extract:path
             $(, arborium = $arb:literal)?
             $(, devicon = $dev:literal)?
+            $(, injections = $inj:path)?
             ;
         )*
         @lexer_only [$($lex:literal),* $(,)?]
@@ -97,6 +102,7 @@ macro_rules! define_languages {
                 extensions: &[$($ext),+],
                 grammar: $grammar,
                 extract: $extract,
+                injections: __opt!($($inj)?),
             }, )*
         ];
     };
@@ -135,7 +141,7 @@ define_languages! {
     ["sh", "bash", "zsh"]                   => arborium_bash::language,       code_units::extract_bash,       arborium = "bash",       devicon = "devicon-bash-plain";
     ["nix"]                                 => arborium_nix::language,        code_units::extract_nix,        arborium = "nix";
     ["lean"]                                => arborium_lean::language,       code_units::extract_lean,       arborium = "lean";
-    ["svelte"]                              => arborium_svelte::language,     code_units::extract_svelte,     arborium = "svelte";
+    ["svelte"]                              => arborium_svelte::language,     code_units::extract_svelte,     arborium = "svelte",     injections = arborium_svelte::INJECTIONS_QUERY;
     // YAML and JSON5 are config/data formats: they carry requirement refs in
     // comments (scanned via the grammar) but expose no structural code units,
     // so they share the no-op `extract_config`. JSON5 reuses the TS grammar for

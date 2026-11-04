@@ -14,10 +14,12 @@
 //! - Code added without updating the spec
 //! - Potential dead code or technical debt
 
+use crate::injections::parse_injections;
+use crate::languages::Lang;
 use crate::lexer::is_valid_req_char;
 use crate::positions::{ByteOffset, LineNumber, RefLocation};
 use crate::{RuleId, parse_rule_id};
-use arborium::tree_sitter::{Node, Parser};
+use arborium::tree_sitter::{Language, Node, Parser};
 use std::path::{Path, PathBuf};
 
 /// A semantic unit of code (function, struct, impl, etc.)
@@ -150,10 +152,38 @@ impl CodeUnits {
 /// Extract code units from source code, auto-detecting language from file extension
 pub fn extract(path: &Path, source: &str) -> CodeUnits {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    match crate::languages::for_ext(ext) {
-        Some(lang) => (lang.extract)(path, source),
-        None => CodeUnits::new(),
+    let Some(lang) = crate::languages::for_ext(ext) else {
+        return CodeUnits::new();
+    };
+    let mut units = (lang.extract)(path, source);
+    if let Some(query) = lang.injections {
+        extend_with_injected_units(path, source, lang, query, &mut units);
     }
+    units
+}
+
+fn extend_with_injected_units(
+    path: &Path,
+    source: &str,
+    lang: &Lang,
+    query: &str,
+    units: &mut CodeUnits,
+) {
+    let language: Language = (lang.grammar)().into();
+    let mut parser = Parser::new();
+    parser
+        .set_language(&language)
+        .expect("Failed to load grammar");
+
+    // Parsed a second time because each language's extractor keeps its tree; sharing one would change all 33.
+    let Some(tree) = parser.parse(source, None) else {
+        return;
+    };
+    for injection in parse_injections(query, &language, tree.root_node(), source) {
+        let root = injection.tree.root_node();
+        extract_units_recursive(path, source, root, units, injection.lang.node_kind);
+    }
+    units.units.sort_by_key(|u| u.start_byte);
 }
 
 /// No-op code-unit extractor for config/data languages (YAML, JSON5).
@@ -329,7 +359,7 @@ fn python_node_kind(kind: &str) -> Option<CodeUnitKind> {
     }
 }
 
-fn typescript_node_kind(kind: &str) -> Option<CodeUnitKind> {
+pub(crate) fn typescript_node_kind(kind: &str) -> Option<CodeUnitKind> {
     match kind {
         "function_declaration" => Some(CodeUnitKind::Function),
         "method_definition" => Some(CodeUnitKind::Function),
@@ -1502,16 +1532,28 @@ pub fn extract_refs_with_warnings(path: &Path, source: &str) -> ExtractedRefs {
     let Some(lang) = crate::languages::for_ext(ext) else {
         return ExtractedRefs::default();
     };
-    let language = (lang.grammar)();
+    let language: Language = (lang.grammar)().into();
 
     let mut parser = Parser::new();
     parser
-        .set_language(&language.into())
+        .set_language(&language)
         .expect("Failed to load grammar");
 
     let Some(tree) = parser.parse(source, None) else {
         return ExtractedRefs::default();
     };
+    let injections = lang
+        .injections
+        .map(|query| parse_injections(query, &language, tree.root_node(), source))
+        .unwrap_or_default();
+
+    let mut comments = Vec::new();
+    collect_comment_nodes(tree.root_node(), &mut comments);
+    for injection in &injections {
+        collect_comment_nodes(injection.tree.root_node(), &mut comments);
+    }
+    // Ignore directives apply in file order, and the host and each injected region are separate trees.
+    comments.sort_by_key(|node| node.start_byte());
 
     // Pre-compute file-level code mask for doc-comment groups so that fenced
     // code blocks spanning multiple `///` / `//!` lines are properly masked.
@@ -1520,14 +1562,23 @@ pub fn extract_refs_with_warnings(path: &Path, source: &str) -> ExtractedRefs {
     let mut refs = Vec::new();
     let mut warnings = Vec::new();
     let mut ignore_state = IgnoreState::default();
-    extract_refs_recursive(
-        source,
-        tree.root_node(),
-        &mut refs,
-        &mut warnings,
-        &mut ignore_state,
-        &file_code_mask,
-    );
+    for node in comments {
+        let text = &source[node.byte_range()];
+        let line = LineNumber::from_zero_based(node.start_position().row);
+        let base_offset = ByteOffset::from_usize(node.start_byte());
+
+        // Check ignore directives and determine if we should extract refs
+        if check_ignore_directives(text, line, &mut ignore_state) {
+            extract_full_refs_from_text(
+                text,
+                line,
+                base_offset,
+                &file_code_mask,
+                &mut refs,
+                &mut warnings,
+            );
+        }
+    }
     ExtractedRefs {
         references: refs,
         warnings,
@@ -1588,23 +1639,15 @@ fn check_ignore_directives(text: &str, line: LineNumber, state: &mut IgnoreState
     true
 }
 
-fn extract_refs_recursive(
-    source: &str,
-    node: Node,
-    refs: &mut Vec<FullReqRef>,
-    warnings: &mut Vec<FullReqRefWarning>,
-    ignore_state: &mut IgnoreState,
-    file_code_mask: &[bool],
-) {
-    // Check if this is a comment node
+fn is_comment_kind(kind: &str) -> bool {
     // Different languages and comment styles:
     // - Rust: line_comment (//), block_comment (/* */),
     //         line_outer_doc_comment (///), line_inner_doc_comment (//!),
     //         block_outer_doc_comment (/** */), block_inner_doc_comment (/*! */)
     // - Swift/Go/TypeScript: comment
     // - Python: comment
-    let is_comment = matches!(
-        node.kind(),
+    matches!(
+        kind,
         "line_comment"
             | "block_comment"
             | "comment"
@@ -1615,23 +1658,19 @@ fn extract_refs_recursive(
             | "line_inner_doc_comment"
             | "block_outer_doc_comment"
             | "block_inner_doc_comment"
-    );
+    )
+}
 
-    if is_comment {
-        let text = &source[node.byte_range()];
-        let line = LineNumber::from_zero_based(node.start_position().row);
-        let base_offset = ByteOffset::from_usize(node.start_byte());
-
-        // Check ignore directives and determine if we should extract refs
-        if check_ignore_directives(text, line, ignore_state) {
-            extract_full_refs_from_text(text, line, base_offset, file_code_mask, refs, warnings);
-        }
+fn collect_comment_nodes<'tree>(node: Node<'tree>, comments: &mut Vec<Node<'tree>>) {
+    // Check if this is a comment node
+    if is_comment_kind(node.kind()) {
+        comments.push(node);
     }
 
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        extract_refs_recursive(source, child, refs, warnings, ignore_state, file_code_mask);
+        collect_comment_nodes(child, comments);
     }
 }
 
@@ -3347,5 +3386,140 @@ function helper {
         assert_eq!(refs.references[0].prefix, "r");
         assert_eq!(refs.references[0].verb, "impl");
         assert_eq!(refs.references[0].req_id.to_string(), "foo.bar");
+    }
+
+    mod injected_regions {
+        use super::*;
+
+        fn line_of(source: &str, needle: &str) -> usize {
+            let index = source.find(needle).expect("needle is in source");
+            source[..index].matches('\n').count() + 1
+        }
+
+        fn ref_ids(refs: &[FullReqRef]) -> Vec<String> {
+            refs.iter().map(|r| r.req_id.to_string()).collect()
+        }
+
+        #[test]
+        fn line_comment_in_script_is_found_at_its_line() {
+            let source = "<script>\n  let count = 0;\n  // r[impl svelte.script]\n</script>\n";
+            let refs = extract_refs(Path::new("c.svelte"), source);
+            assert_eq!(ref_ids(&refs), ["svelte.script"]);
+            assert_eq!(refs[0].line, line_of(source, "r[impl svelte.script]"));
+        }
+
+        #[test]
+        fn block_comment_in_typescript_script_is_found_once_at_its_line() {
+            let source = "<script lang=\"ts\">\n  let count: number = 0;\n  /* r[impl svelte.ts] */\n</script>\n";
+            let refs = extract_refs(Path::new("c.svelte"), source);
+            assert_eq!(ref_ids(&refs), ["svelte.ts"]);
+            assert_eq!(refs[0].line, line_of(source, "r[impl svelte.ts]"));
+        }
+
+        #[test]
+        fn reference_span_in_script_covers_the_annotation() {
+            let annotation = "r[impl svelte.span]";
+            let source = format!("<script>\n  // {annotation}\n</script>\n");
+            let refs = extract_refs(Path::new("c.svelte"), &source);
+            assert_eq!(refs.len(), 1);
+            let span = refs[0].byte_offset..refs[0].byte_offset + refs[0].byte_length;
+            assert_eq!(&source[span], annotation);
+        }
+
+        #[test]
+        fn html_and_script_comments_are_each_found_once() {
+            let source =
+                "<!-- r[impl svelte.html] -->\n<script>\n  // r[impl svelte.script]\n</script>\n";
+            let refs = extract_refs(Path::new("c.svelte"), source);
+            assert_eq!(ref_ids(&refs), ["svelte.html", "svelte.script"]);
+            assert_eq!(refs[0].line, line_of(source, "r[impl svelte.html]"));
+        }
+
+        #[test]
+        fn comment_in_template_expression_is_found_once_at_its_line() {
+            let source = "<script>\n  let count = 0;\n</script>\n\n<p>{count /* r[impl svelte.expr] */}</p>\n";
+            let refs = extract_refs(Path::new("c.svelte"), source);
+            assert_eq!(ref_ids(&refs), ["svelte.expr"]);
+            assert_eq!(refs[0].line, line_of(source, "r[impl svelte.expr]"));
+        }
+
+        #[test]
+        fn comment_in_style_is_not_scanned() {
+            let source = "<style>\n  /* r[impl svelte.style] */\n  p { color: red; }\n</style>\n";
+            let refs = extract_refs(Path::new("c.svelte"), source);
+            assert_eq!(ref_ids(&refs), Vec::<String>::new());
+        }
+
+        #[test]
+        fn ignore_next_line_in_script_skips_only_the_next_line() {
+            let source = "<script>\n  // @tracey:ignore-next-line\n  // r[impl svelte.ignored]\n  // r[impl svelte.kept]\n</script>\n";
+            let refs = extract_refs(Path::new("c.svelte"), source);
+            assert_eq!(ref_ids(&refs), ["svelte.kept"]);
+        }
+
+        #[test]
+        fn ignore_block_in_script_skips_references_inside_it() {
+            let source = "<script>\n  // @tracey:ignore-start\n  // r[impl svelte.ignored]\n  // @tracey:ignore-end\n  // r[impl svelte.kept]\n</script>\n";
+            let refs = extract_refs(Path::new("c.svelte"), source);
+            assert_eq!(ref_ids(&refs), ["svelte.kept"]);
+        }
+
+        #[test]
+        fn ignore_block_opened_in_html_covers_the_script() {
+            let source = "<!-- @tracey:ignore-start -->\n<script>\n  // r[impl svelte.ignored]\n</script>\n<!-- @tracey:ignore-end -->\n<!-- r[impl svelte.kept] -->\n";
+            let refs = extract_refs(Path::new("c.svelte"), source);
+            assert_eq!(ref_ids(&refs), ["svelte.kept"]);
+        }
+
+        #[test]
+        fn function_in_script_is_a_code_unit_with_its_annotation() {
+            let source = "<script>\n  // r[impl svelte.greet]\n  function greet() {}\n</script>\n";
+            let units = extract(Path::new("c.svelte"), source);
+            let greet = units
+                .units
+                .iter()
+                .find(|u| u.name.as_deref() == Some("greet"))
+                .expect("greet is a code unit");
+            assert_eq!(greet.kind, CodeUnitKind::Function);
+            assert_eq!(greet.start_line, line_of(source, "// r[impl svelte.greet]"));
+            assert_eq!(greet.end_line, line_of(source, "function greet() {}"));
+            assert_eq!(greet.req_refs, vec![rid("svelte.greet")]);
+        }
+
+        #[test]
+        fn function_in_typescript_script_is_a_code_unit_with_its_annotation() {
+            let source = "<script lang=\"ts\">\n  // r[impl svelte.greet]\n  function greet(name: string): void {}\n</script>\n";
+            let units = extract(Path::new("c.svelte"), source);
+            let greet = units
+                .units
+                .iter()
+                .find(|u| u.name.as_deref() == Some("greet"))
+                .expect("greet is a code unit");
+            assert_eq!(greet.kind, CodeUnitKind::Function);
+            assert_eq!(greet.start_line, line_of(source, "// r[impl svelte.greet]"));
+            assert_eq!(greet.req_refs, vec![rid("svelte.greet")]);
+        }
+
+        #[test]
+        fn code_units_are_in_file_order() {
+            let source = "{#snippet row()}\n  <p>row</p>\n{/snippet}\n\n<script>\n  function greet() {}\n</script>\n";
+            let units = extract(Path::new("c.svelte"), source);
+            let start_lines: Vec<usize> = units.units.iter().map(|u| u.start_line).collect();
+            assert_eq!(
+                start_lines,
+                [
+                    line_of(source, "{#snippet row()}"),
+                    line_of(source, "<script>"),
+                    line_of(source, "function greet() {}"),
+                ]
+            );
+        }
+
+        #[test]
+        fn rust_macro_comment_is_found_once() {
+            let source = "fn main() {\n    let v = vec![\n        // r[impl rust.macro]\n        1,\n    ];\n}\n";
+            let refs = extract_refs(Path::new("c.rs"), source);
+            assert_eq!(ref_ids(&refs), ["rust.macro"]);
+        }
     }
 }
