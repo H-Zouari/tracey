@@ -57,11 +57,12 @@ fn is_mutation_event(event: &Event) -> bool {
 /// Events sent from the watcher to the rebuild loop.
 #[derive(Debug)]
 pub enum WatcherEvent {
-    /// Files changed - contains the list of raw notify events.
-    FilesChanged(Vec<Event>),
+    /// Files changed - contains the list of raw notify events and the highest
+    /// pending-change mark taken for them (0 when none was relevant).
+    FilesChanged(Vec<Event>, u64),
 
     /// Config or gitignore changed - triggers reconfiguration.
-    Reconfigure,
+    Reconfigure(u64),
 }
 
 // ============================================================================
@@ -298,30 +299,47 @@ pub fn extract_watch_dirs_from_config(config: &Config, project_root: &Path) -> H
 ///
 /// The quiet period timer is reset on every incoming event. When no new events
 /// arrive for `batch_duration`, all accumulated events are delivered together.
-struct EventBatcher<F> {
+/// A batch is also delivered once it is `max_batch_age` old, so a continuous
+/// stream of events cannot hold it back indefinitely.
+struct EventBatcher<F, A> {
     /// Accumulated events waiting to be delivered.
     pending_events: Vec<Event>,
 
     /// Timestamp of the most recent event in this batch.
     last_event_at: Option<Instant>,
 
+    first_event_at: Option<Instant>,
+
     /// How long to wait before delivering a batch.
     batch_duration: Duration,
 
+    max_batch_age: Duration,
+
+    batch_mark: u64,
+
     /// Callback to deliver batched events.
     on_batch: F,
+
+    /// Called for each mutation event as it arrives; returns a pending-change
+    /// mark, or 0 when the event is not relevant.
+    on_arrival: A,
 }
 
-impl<F> EventBatcher<F>
+impl<F, A> EventBatcher<F, A>
 where
-    F: FnMut(Vec<Event>),
+    F: FnMut(Vec<Event>, u64),
+    A: FnMut(&Event) -> u64,
 {
-    fn new(batch_duration: Duration, on_batch: F) -> Self {
+    fn new(batch_duration: Duration, max_batch_age: Duration, on_batch: F, on_arrival: A) -> Self {
         Self {
             pending_events: Vec::new(),
             last_event_at: None,
+            first_event_at: None,
             batch_duration,
+            max_batch_age,
+            batch_mark: 0,
             on_batch,
+            on_arrival,
         }
     }
 
@@ -338,27 +356,34 @@ where
 
         debug!(?event, "notify event");
 
-        self.last_event_at = Some(Instant::now());
+        self.batch_mark = self.batch_mark.max((self.on_arrival)(&event));
+        let now = Instant::now();
+        self.last_event_at = Some(now);
+        self.first_event_at.get_or_insert(now);
         self.pending_events.push(event);
     }
 
     /// Check if the batch is ready to be delivered.
     fn should_flush(&self) -> bool {
-        if let Some(last) = self.last_event_at {
-            last.elapsed() >= self.batch_duration
-        } else {
-            false
-        }
+        let quiet = self
+            .last_event_at
+            .is_some_and(|last| last.elapsed() >= self.batch_duration);
+        let too_old = self
+            .first_event_at
+            .is_some_and(|first| first.elapsed() >= self.max_batch_age);
+        quiet || too_old
     }
 
     /// Deliver the current batch if ready.
     fn flush_if_ready(&mut self) {
         if self.should_flush() && !self.pending_events.is_empty() {
             let events = std::mem::take(&mut self.pending_events);
+            let mark = std::mem::take(&mut self.batch_mark);
             self.last_event_at = None;
+            self.first_event_at = None;
 
-            debug!(count = events.len(), "delivering batched events");
-            (self.on_batch)(events);
+            debug!(count = events.len(), mark, "delivering batched events");
+            (self.on_batch)(events, mark);
         }
     }
 }
@@ -393,17 +418,25 @@ impl WatcherManager {
     ///
     /// The watcher starts with no directories watched. Call `reconfigure()`
     /// after creation to set up watches based on config.
-    pub fn new<F>(
+    pub fn new<F, A>(
         project_root: PathBuf,
         config_path: PathBuf,
         batch_duration: Duration,
+        max_batch_age: Duration,
         event_handler: F,
+        on_arrival: A,
     ) -> Result<Self>
     where
-        F: Fn(Vec<Event>) + Send + 'static,
+        F: Fn(Vec<Event>, u64) + Send + 'static,
+        A: Fn(&Event) -> u64 + Send + 'static,
     {
         // Wrap the handler in a batcher protected by a mutex
-        let batcher = Arc::new(Mutex::new(EventBatcher::new(batch_duration, event_handler)));
+        let batcher = Arc::new(Mutex::new(EventBatcher::new(
+            batch_duration,
+            max_batch_age,
+            event_handler,
+            on_arrival,
+        )));
         let batcher_for_watcher = Arc::clone(&batcher);
 
         // Spawn a timer task to periodically flush batched events
@@ -763,5 +796,57 @@ mod tests {
         // Any and Other events should also be rejected
         assert!(!is_mutation_event(&make_event(EventKind::Any)));
         assert!(!is_mutation_event(&make_event(EventKind::Other)));
+    }
+
+    #[test]
+    fn test_batcher_delivers_a_continuous_stream_at_max_age_with_its_highest_mark() {
+        use notify::event::ModifyKind;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let delivered: Rc<Cell<Option<(usize, u64)>>> = Rc::new(Cell::new(None));
+        let marks_issued = Rc::new(Cell::new(0u64));
+        let mut batcher = EventBatcher::new(
+            Duration::from_millis(100),
+            Duration::from_millis(150),
+            {
+                let delivered = Rc::clone(&delivered);
+                move |events: Vec<Event>, mark| delivered.set(Some((events.len(), mark)))
+            },
+            {
+                let marks_issued = Rc::clone(&marks_issued);
+                move |event: &Event| {
+                    if event.paths[0].extension().is_some_and(|ext| ext == "rs") {
+                        marks_issued.set(marks_issued.get() + 1);
+                        marks_issued.get()
+                    } else {
+                        0
+                    }
+                }
+            },
+        );
+
+        let mut pushed = 0;
+        let mut first_batch = None;
+        for i in 0..40 {
+            let path = if i % 2 == 0 { "/p/a.rs" } else { "/p/notes.txt" };
+            batcher.push(Event {
+                kind: EventKind::Modify(ModifyKind::Any),
+                paths: vec![PathBuf::from(path)],
+                attrs: Default::default(),
+            });
+            pushed += 1;
+            batcher.flush_if_ready();
+            if let Some((count, mark)) = delivered.take() {
+                first_batch = Some((count, mark, pushed, marks_issued.get()));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (count, mark, pushed_so_far, issued_so_far) =
+            first_batch.expect("a batch is delivered while events keep arriving");
+        assert_eq!(count, pushed_so_far);
+        assert_eq!(mark, issued_so_far);
     }
 }

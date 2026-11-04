@@ -6,13 +6,14 @@
 //! r[impl server.state.version]
 //!
 //! The engine owns the `DashboardData`, file watcher, and VFS overlay.
-//! It provides blocking rebuild semantics - all requests wait during rebuild.
+//! It provides blocking rebuild semantics - requests wait until file changes
+//! the watcher has seen are included in a finished rebuild.
 
 use eyre::Result;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -64,6 +65,7 @@ pub struct Engine {
     rebuild_state: Arc<Mutex<RebuildCoalesceState>>,
     /// Notifies waiters when a coalesced rebuild pass completes
     rebuild_notify: Arc<Notify>,
+    pending_changes: Arc<PendingChanges>,
 }
 
 #[derive(Default)]
@@ -76,6 +78,57 @@ struct RebuildCoalesceState {
     pending_ticket: u64,
     applied_ticket: u64,
     last_result: Option<std::result::Result<(u64, Duration), String>>,
+    pending_mark: u64,
+}
+
+// Reaching this means a watcher mark was never settled; a rebuild of a large
+// repository finishes well within it, and the request then gets the data it has.
+const PENDING_CHANGES_MAX_WAIT: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+pub struct PendingChanges {
+    marked: AtomicU64,
+    applied: AtomicU64,
+    applied_notify: Notify,
+}
+
+impl PendingChanges {
+    pub fn mark(&self) -> u64 {
+        self.marked.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn apply(&self, mark: u64) {
+        if mark == 0 {
+            return;
+        }
+        self.applied.fetch_max(mark, Ordering::SeqCst);
+        self.applied_notify.notify_waiters();
+    }
+
+    async fn wait_until_applied(&self) {
+        let target = self.marked.load(Ordering::SeqCst);
+        if self.applied.load(Ordering::SeqCst) >= target {
+            return;
+        }
+        let waited = tokio::time::timeout(PENDING_CHANGES_MAX_WAIT, async {
+            loop {
+                let notified = self.applied_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.applied.load(Ordering::SeqCst) >= target {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
+        if waited.is_err() {
+            warn!(
+                "Waited {:?} for pending file changes (mark {}); serving current data",
+                PENDING_CHANGES_MAX_WAIT, target
+            );
+        }
+    }
 }
 
 impl Engine {
@@ -211,15 +264,26 @@ impl Engine {
             spec_file_deps: Arc::new(RwLock::new(Arc::new(HashSet::new()))),
             rebuild_state: Arc::new(Mutex::new(RebuildCoalesceState::default())),
             rebuild_notify: Arc::new(Notify::new()),
+            pending_changes: Arc::new(PendingChanges::default()),
         };
         Ok(engine)
     }
 
     /// Get the current dashboard data.
     ///
-    /// This acquires a read lock, blocking if a rebuild is in progress.
+    /// Waits until every file change the watcher saw before this call is
+    /// included in a finished rebuild.
     pub async fn data(&self) -> Arc<DashboardData> {
+        self.pending_changes.wait_until_applied().await;
+        self.current_data().await
+    }
+
+    pub async fn current_data(&self) -> Arc<DashboardData> {
         self.data.read().await.clone()
+    }
+
+    pub fn pending_changes(&self) -> Arc<PendingChanges> {
+        Arc::clone(&self.pending_changes)
     }
 
     /// Get a receiver for data updates.
@@ -279,12 +343,26 @@ impl Engine {
     }
 
     pub async fn rebuild_with_changes(&self, changed_files: &[PathBuf]) -> Result<(u64, Duration)> {
-        self.run_coalesced_rebuild(changed_files, true).await
+        self.run_coalesced_rebuild(changed_files, true, 0).await
     }
 
     pub async fn schedule_rebuild_with_changes(&self, changed_files: &[PathBuf]) {
-        if let Err(e) = self.run_coalesced_rebuild(changed_files, false).await {
+        self.schedule_rebuild_for_mark(changed_files, 0).await;
+    }
+
+    pub async fn schedule_rebuild_for_mark(&self, changed_files: &[PathBuf], mark: u64) {
+        if let Err(e) = self.run_coalesced_rebuild(changed_files, false, mark).await {
             error!("Scheduled rebuild failed: {}", e);
+        }
+    }
+
+    pub async fn settle_mark(&self, mark: u64) {
+        let mut state = self.rebuild_state.lock().await;
+        state.pending_mark = state.pending_mark.max(mark);
+        if !state.in_progress {
+            let settled = state.pending_mark;
+            drop(state);
+            self.pending_changes.apply(settled);
         }
     }
 
@@ -292,11 +370,13 @@ impl Engine {
         &self,
         changed_files: &[PathBuf],
         wait_for_completion: bool,
+        mark: u64,
     ) -> Result<(u64, Duration)> {
         let waiter_ticket = {
             let mut state = self.rebuild_state.lock().await;
             state.next_ticket = state.next_ticket.saturating_add(1);
             let request_ticket = state.next_ticket;
+            state.pending_mark = state.pending_mark.max(mark);
 
             if changed_files.is_empty() {
                 state.pending_full_rebuild = true;
@@ -338,27 +418,29 @@ impl Engine {
         }
 
         loop {
-            let (changed_batch, batch_ticket) = {
+            let (changed_batch, batch_ticket, batch_mark) = {
                 let mut state = self.rebuild_state.lock().await;
                 let pending_full = state.pending_full_rebuild;
                 state.pending_full_rebuild = false;
                 let ticket = state.pending_ticket;
+                let mark = state.pending_mark;
 
                 if pending_full {
                     state.pending_changed_files.clear();
-                    (Vec::new(), ticket)
+                    (Vec::new(), ticket, mark)
                 } else {
                     (
                         std::mem::take(&mut state.pending_changed_files)
                             .into_iter()
                             .collect::<Vec<_>>(),
                         ticket,
+                        mark,
                     )
                 }
             };
 
             let result = self.rebuild_once(&changed_batch).await;
-            let should_continue = {
+            let (should_continue, applied_mark) = {
                 let mut state = self.rebuild_state.lock().await;
                 state.last_result = Some(match &result {
                     Ok(v) => Ok(*v),
@@ -373,8 +455,16 @@ impl Engine {
                 if !has_pending {
                     state.in_progress = false;
                 }
-                has_pending
+                // Marks settled during this pass carry no file changes, so
+                // they are covered once nothing else is queued.
+                let applied_mark = if has_pending {
+                    batch_mark
+                } else {
+                    state.pending_mark
+                };
+                (has_pending, applied_mark)
             };
+            self.pending_changes.apply(applied_mark);
 
             if !should_continue {
                 return result;
@@ -478,7 +568,7 @@ impl Engine {
         // Broadcast to subscribers
         let _ = self.update_tx.send(new_data);
         if self.search_activated.load(Ordering::Relaxed) {
-            let snapshot = self.data().await;
+            let snapshot = self.current_data().await;
             self.spawn_search_reindex(snapshot);
         }
 
@@ -498,6 +588,10 @@ impl Engine {
     /// consistent snapshot without copying every `PathBuf` per watcher tick.
     pub async fn spec_file_deps(&self) -> Arc<HashSet<PathBuf>> {
         self.spec_file_deps.read().await.clone()
+    }
+
+    pub fn try_spec_file_deps(&self) -> Option<Arc<HashSet<PathBuf>>> {
+        self.spec_file_deps.try_read().ok().map(|deps| deps.clone())
     }
 
     /// Merge `deps` (project-relative) into the watched typst-dependency set.

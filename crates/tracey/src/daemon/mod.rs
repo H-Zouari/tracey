@@ -52,6 +52,10 @@ pub use watcher::WatcherState as DaemonWatcherState;
 /// Default idle timeout in seconds (10 minutes)
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 
+// Longest a continuous stream of writes (a checkout, a formatter run) can hold
+// back a batch, and with it waiting requests. Five quiet periods; tuned by measurement.
+const WATCH_MAX_BATCH_AGE: Duration = Duration::from_secs(1);
+
 /// Socket file name within the state directory (Unix only)
 #[cfg(unix)]
 const SOCKET_FILENAME: &str = "daemon.sock";
@@ -245,6 +249,10 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
             .wrap_err("Failed to initialize engine")?,
     );
 
+    let watch_filter = Arc::new(std::sync::RwLock::new(
+        WatchFilter::build(&project_root, &config_path, &engine).await,
+    ));
+
     // r[impl daemon.state.file-watcher]
     // Set up file watcher with smart directory watching
     let watcher_state = WatcherState::new();
@@ -259,6 +267,8 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
     let config_path_for_watcher = config_path.clone();
     let project_root_for_watcher = project_root.clone();
     let watcher_state_for_thread = Arc::clone(&watcher_state);
+    let watch_filter_for_watcher = Arc::clone(&watch_filter);
+    let engine_for_watcher = Arc::clone(&engine);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -278,6 +288,8 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                     &config_path_for_watcher,
                     watcher_tx.clone(),
                     Arc::clone(&watcher_state_for_thread),
+                    Arc::clone(&watch_filter_for_watcher),
+                    Arc::clone(&engine_for_watcher),
                 )
                 .await
                 {
@@ -301,35 +313,30 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
     let engine_for_rebuild = Arc::clone(&engine);
     let project_root_for_rebuild = project_root.clone();
     let config_path_for_rebuild = config_path.clone();
+    let watch_filter_for_rebuild = Arc::clone(&watch_filter);
     tokio::spawn(async move {
-        // r[impl server.watch.respect-gitignore]
-        // Build gitignore matcher for filtering file watcher events
-        let mut gitignore = build_gitignore(&project_root_for_rebuild);
-        // r[impl server.watch.patterns-from-config]
-        // r[impl server.watch.respect-excludes]
-        // Compile include/exclude globs once up front; rebuilt only on
-        // `Reconfigure` so the per-event hot path is a cheap `is_match`.
-        let (mut include_set, mut include_configured, mut exclude_set) =
-            build_watch_globsets(&config_path_for_rebuild, &engine_for_rebuild).await;
-        let canonical_project_root = std::fs::canonicalize(&project_root_for_rebuild)
-            .unwrap_or_else(|_| project_root_for_rebuild.clone());
-
         while let Some(event) = watcher_rx.recv().await {
             match event {
-                WatcherEvent::Reconfigure => {
+                WatcherEvent::Reconfigure(mark) => {
                     info!("Config or gitignore changed, reconfiguring watcher");
 
                     // Rebuild gitignore matcher
-                    gitignore = build_gitignore(&project_root_for_rebuild);
+                    let rebuilt = WatchFilter::build(
+                        &project_root_for_rebuild,
+                        &config_path_for_rebuild,
+                        &engine_for_rebuild,
+                    )
+                    .await;
+                    *watch_filter_for_rebuild.write().unwrap() = rebuilt;
                     debug!("Rebuilt gitignore matcher");
-                    (include_set, include_configured, exclude_set) =
-                        build_watch_globsets(&config_path_for_rebuild, &engine_for_rebuild).await;
 
                     // Trigger rebuild (watcher reconfiguration happens in the watcher thread)
-                    engine_for_rebuild.schedule_rebuild_with_changes(&[]).await;
+                    engine_for_rebuild
+                        .schedule_rebuild_for_mark(&[], mark)
+                        .await;
                 }
 
-                WatcherEvent::FilesChanged(events) => {
+                WatcherEvent::FilesChanged(events, mark) => {
                     // Extract all paths from the batch of events
                     let changed_files: Vec<PathBuf> = events
                         .iter()
@@ -344,37 +351,10 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                     let spec_deps = engine_for_rebuild.spec_file_deps().await;
 
                     // Filter changed files
-                    let relative_paths: Vec<PathBuf> = changed_files
-                        .iter()
-                        .filter_map(|p| {
-                            if let Ok(rel) = p.strip_prefix(&project_root_for_rebuild) {
-                                return Some(rel.to_path_buf());
-                            }
-                            let canonical = p.canonicalize().ok()?;
-                            canonical
-                                .strip_prefix(&canonical_project_root)
-                                .ok()
-                                .map(Path::to_path_buf)
-                        })
-                        .filter(|p| !is_temporary_edit_artifact(p))
-                        .filter(|p| {
-                            // Hoist the only FS-touching bit so the predicate
-                            // itself stays pure and unit-testable.
-                            let is_dir = project_root_for_rebuild.join(p).is_dir();
-                            accept_changed_path(
-                                p,
-                                is_dir,
-                                &project_root_for_rebuild,
-                                &spec_deps,
-                                &PathFilter {
-                                    gitignore: &gitignore,
-                                    exclude_set: &exclude_set,
-                                    include_set: &include_set,
-                                    include_configured,
-                                },
-                            )
-                        })
-                        .collect();
+                    let relative_paths = watch_filter_for_rebuild
+                        .read()
+                        .unwrap()
+                        .relevant_paths(&changed_files, &spec_deps);
 
                     // Skip rebuild if no relevant files changed
                     if relative_paths.is_empty() {
@@ -382,6 +362,7 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                             "Filtered out {} file changes (no relevant files)",
                             changed_files.len()
                         );
+                        engine_for_rebuild.settle_mark(mark).await;
                         continue;
                     }
 
@@ -412,7 +393,7 @@ pub async fn run(project_root: PathBuf, config_path: PathBuf) -> Result<()> {
                         .map(|p| project_root_for_rebuild.join(p))
                         .collect();
                     engine_for_rebuild
-                        .schedule_rebuild_with_changes(&changed_abs)
+                        .schedule_rebuild_for_mark(&changed_abs, mark)
                         .await;
                 }
             }
@@ -655,7 +636,7 @@ async fn build_watch_globsets(
             }
         }
     } else {
-        let data = engine.data().await;
+        let data = engine.current_data().await;
         for spec in &data.config.specs {
             if let Some(source) = &spec.source {
                 include.push(source.clone());
@@ -664,6 +645,79 @@ async fn build_watch_globsets(
     }
     let include_configured = !include.is_empty();
     (build_globset(&include), include_configured, build_globset(&exclude))
+}
+
+/// The watch filter, owned so the rebuild loop and the watcher thread can
+/// share one copy. Replaced as a whole on `Reconfigure`.
+struct WatchFilter {
+    project_root: PathBuf,
+    canonical_project_root: PathBuf,
+    gitignore: ignore::gitignore::Gitignore,
+    include_set: GlobSet,
+    include_configured: bool,
+    exclude_set: GlobSet,
+}
+
+impl WatchFilter {
+    async fn build(project_root: &Path, config_path: &PathBuf, engine: &Arc<Engine>) -> Self {
+        // r[impl server.watch.respect-gitignore]
+        // Build gitignore matcher for filtering file watcher events
+        let gitignore = build_gitignore(project_root);
+        // r[impl server.watch.patterns-from-config]
+        // r[impl server.watch.respect-excludes]
+        // Compile include/exclude globs once up front; rebuilt only on
+        // `Reconfigure` so the per-event hot path is a cheap `is_match`.
+        let (include_set, include_configured, exclude_set) =
+            build_watch_globsets(config_path, engine).await;
+        let canonical_project_root = std::fs::canonicalize(project_root)
+            .unwrap_or_else(|_| project_root.to_path_buf());
+        Self {
+            project_root: project_root.to_path_buf(),
+            canonical_project_root,
+            gitignore,
+            include_set,
+            include_configured,
+            exclude_set,
+        }
+    }
+
+    fn relevant_paths(
+        &self,
+        changed_files: &[PathBuf],
+        spec_deps: &HashSet<PathBuf>,
+    ) -> Vec<PathBuf> {
+        changed_files
+            .iter()
+            .filter_map(|p| {
+                if let Ok(rel) = p.strip_prefix(&self.project_root) {
+                    return Some(rel.to_path_buf());
+                }
+                let canonical = p.canonicalize().ok()?;
+                canonical
+                    .strip_prefix(&self.canonical_project_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .filter(|p| !is_temporary_edit_artifact(p))
+            .filter(|p| {
+                // Hoist the only FS-touching bit so the predicate
+                // itself stays pure and unit-testable.
+                let is_dir = self.project_root.join(p).is_dir();
+                accept_changed_path(
+                    p,
+                    is_dir,
+                    &self.project_root,
+                    spec_deps,
+                    &PathFilter {
+                        gitignore: &self.gitignore,
+                        exclude_set: &self.exclude_set,
+                        include_set: &self.include_set,
+                        include_configured: self.include_configured,
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 fn path_triggers_reconfigure(path: &Path, config_path: &Path, gitignore_path: &Path) -> bool {
@@ -696,6 +750,8 @@ async fn run_smart_watcher(
     config_path: &Path,
     tx: tokio::sync::mpsc::Sender<WatcherEvent>,
     state: Arc<WatcherState>,
+    watch_filter: Arc<std::sync::RwLock<WatchFilter>>,
+    engine: Arc<Engine>,
 ) -> Result<()> {
     use std::sync::Mutex;
 
@@ -715,13 +771,16 @@ async fn run_smart_watcher(
         gitignore_path.clone(),
     )));
     let reconfigure_paths_for_handler = Arc::clone(&reconfigure_paths);
+    let reconfigure_paths_for_arrival = Arc::clone(&reconfigure_paths);
+    let pending_changes = engine.pending_changes();
 
     // r[impl server.watch.debounce]
     let mut watcher_manager = WatcherManager::new(
         project_root.to_path_buf(),
         config_path_owned,
         Duration::from_millis(200),
-        move |events| {
+        WATCH_MAX_BATCH_AGE,
+        move |events, mark| {
             // Events are already batched; extract all paths from them
             let paths: Vec<PathBuf> = events
                 .iter()
@@ -744,20 +803,40 @@ async fn run_smart_watcher(
 
             let watcher_event = if needs_reconfigure {
                 debug!("Config or gitignore changed, sending Reconfigure event");
-                WatcherEvent::Reconfigure
+                WatcherEvent::Reconfigure(mark)
             } else {
                 debug!(
                     event_count = events.len(),
                     path_count = paths.len(),
                     "batched file changes"
                 );
-                WatcherEvent::FilesChanged(events)
+                WatcherEvent::FilesChanged(events, mark)
             };
 
             if tx_for_handler.blocking_send(watcher_event).is_err() {
                 // Channel closed, watcher should stop
                 debug!("Watcher channel closed");
             }
+        },
+        move |event| {
+            let reconfigures = {
+                let (config_path, gitignore_path) = &*reconfigure_paths_for_arrival.lock().unwrap();
+                event
+                    .paths
+                    .iter()
+                    .any(|p| path_triggers_reconfigure(p, config_path, gitignore_path))
+            };
+            // An unreadable dependency set means a render is recording one
+            // right now; counting the event as relevant only costs a wait.
+            let relevant = reconfigures
+                || engine.try_spec_file_deps().is_none_or(|spec_deps| {
+                    !watch_filter
+                        .read()
+                        .unwrap()
+                        .relevant_paths(&event.paths, &spec_deps)
+                        .is_empty()
+                });
+            if relevant { pending_changes.mark() } else { 0 }
         },
     )?;
 

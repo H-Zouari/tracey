@@ -599,6 +599,66 @@ async fn test_rebuild_modify_source_file() {
 }
 
 #[tokio::test]
+async fn test_data_waits_for_a_pending_watcher_change() {
+    use tracey::daemon::Engine;
+
+    let (temp, config_path) = create_rebuild_test_project(
+        "# Spec\n\nr[auth.login]\nUsers must log in.\n",
+        &[("src/lib.rs", "pub fn placeholder() {}\n")],
+    );
+    let root = temp.path().to_path_buf();
+    let engine = Arc::new(Engine::new(root.clone(), config_path).await.expect("engine"));
+
+    let new_file = root.join("src/login.rs");
+    std::fs::write(&new_file, "/// r[impl auth.login]\npub fn login() {}\n").expect("write");
+    let mark = engine.pending_changes().mark();
+
+    let reader = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        async move { engine.data().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!reader.is_finished(), "the request must wait for the pending change");
+
+    engine
+        .schedule_rebuild_for_mark(std::slice::from_ref(&new_file), mark)
+        .await;
+    let data = reader.await.expect("reader task");
+    assert!(rule_has_impl_refs(&data, "auth.login"));
+}
+
+#[tokio::test]
+async fn test_settled_mark_releases_waiting_requests_without_a_rebuild() {
+    use tracey::daemon::Engine;
+
+    let (temp, config_path) = create_rebuild_test_project(
+        "# Spec\n\nr[auth.login]\nUsers must log in.\n",
+        &[("src/lib.rs", "pub fn placeholder() {}\n")],
+    );
+    let engine = Arc::new(
+        Engine::new(temp.path().to_path_buf(), config_path)
+            .await
+            .expect("engine"),
+    );
+    let version_before = engine.version();
+    let mark = engine.pending_changes().mark();
+
+    let reader = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        async move { engine.data().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!reader.is_finished(), "the request must wait for the pending change");
+
+    engine.settle_mark(mark).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+        .await
+        .expect("settling the mark releases the request")
+        .expect("reader task");
+    assert_eq!(engine.version(), version_before);
+}
+
+#[tokio::test]
 async fn test_validation_checks_files_without_code_units_in_their_own_impl_only() {
     use tracey::daemon::Engine;
     use tracey_proto::ValidationErrorCode;
