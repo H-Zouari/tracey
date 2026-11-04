@@ -2022,7 +2022,7 @@ async fn diff_against_git(
 ) -> Option<String> {
     let historical = load_previous_rule_text_from_git(fmt, project_root, source_file, prev_id).await?;
     Some(diff_inline(fmt, &historical.text, current_raw).unwrap_or_else(|| {
-        // Backend has no format-aware diff (e.g. sdoc). Show both texts so the
+        // Backend could not diff these texts. Show both texts so the
         // hover still satisfies "previous + current + diff" semantics.
         format!("~~{}~~\n\n{}", historical.text, current_raw)
     }))

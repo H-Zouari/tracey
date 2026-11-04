@@ -584,3 +584,160 @@ async fn test_bump_then_pre_commit_passes() {
     let passed = pre_commit(root, &config).await.unwrap();
     assert!(passed, "pre-commit should pass after bump");
 }
+
+// ============================================================================
+// StrictDoc (Fleet Spec Format): the version lives in the VERSION field
+// ============================================================================
+
+const SDOC_SPEC: &str = "\
+[DOCUMENT]
+TITLE: Export
+
+[TERM]
+UID: glossary.exporter
+VERSION: 1
+TITLE: the exporter
+STATUS: active
+DEFINITION: The component that writes invoice exports.
+
+[FUNCTIONAL]
+UID: export.file.name
+VERSION: 2
+TITLE: Export file name
+STATUS: active
+VERIFIED_BY: test
+WHEN: an export file is created
+SYSTEM: the exporter
+KEYWORD: MUST
+RESPONSE: name it by tenant and period
+NOTES: Accountants keep a year of exports in one folder.
+";
+
+fn sdoc_config() -> Config {
+    Config {
+        specs: vec![SpecConfig {
+            name: "test".to_string(),
+            prefix: None,
+            source_url: None,
+            include: vec!["spec.sdoc".to_string()],
+            format: Default::default(),
+            impls: vec![],
+        }],
+    }
+}
+
+/// A repository with `SDOC_SPEC` committed, then `from` replaced by `to` and staged.
+fn sdoc_repo_with_staged_change(from: &str, to: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    fs::write(root.join("spec.sdoc"), SDOC_SPEC).unwrap();
+    git_commit_all(root, "initial");
+
+    assert!(SDOC_SPEC.contains(from), "{from}");
+    fs::write(root.join("spec.sdoc"), SDOC_SPEC.replacen(from, to, 1)).unwrap();
+    git_add(root, "spec.sdoc");
+    dir
+}
+
+fn staged_sdoc(root: &Path) -> String {
+    let out = Command::new("git")
+        .args(["show", ":spec.sdoc"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn sdoc_bump_raises_version_by_one_in_place_and_restages() {
+    let dir = sdoc_repo_with_staged_change(
+        "RESPONSE: name it by tenant and period",
+        "RESPONSE: name it by tenant, start and end date",
+    );
+    let root = dir.path();
+
+    let bumped = bump(root, &sdoc_config()).await.unwrap();
+
+    assert_eq!(bumped.len(), 1);
+    assert_eq!(bumped[0].base, "export.file.name");
+    assert_eq!(bumped[0].version, 3);
+    let staged = staged_sdoc(root);
+    assert!(
+        staged.contains("UID: export.file.name\nVERSION: 3\n"),
+        "{staged}"
+    );
+    assert!(pre_commit(root, &sdoc_config()).await.unwrap());
+}
+
+#[tokio::test]
+async fn sdoc_pre_commit_fails_on_an_unbumped_normative_change_naming_the_uid() {
+    let dir = sdoc_repo_with_staged_change("KEYWORD: MUST", "KEYWORD: SHOULD");
+
+    let changes = detect_changed_rules(dir.path(), &sdoc_config())
+        .await
+        .unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].rule_id.base, "export.file.name");
+    assert!(!pre_commit(dir.path(), &sdoc_config()).await.unwrap());
+}
+
+#[tokio::test]
+async fn sdoc_notes_or_title_change_needs_no_bump() {
+    for (from, to) in [
+        ("NOTES: Accountants keep", "NOTES: Finance keeps"),
+        ("TITLE: Export file name", "TITLE: File name"),
+    ] {
+        let dir = sdoc_repo_with_staged_change(from, to);
+        let root = dir.path();
+
+        assert!(
+            bump(root, &sdoc_config()).await.unwrap().is_empty(),
+            "{from}"
+        );
+        assert!(staged_sdoc(root).contains("VERSION: 2\n"), "{from}");
+        assert!(pre_commit(root, &sdoc_config()).await.unwrap(), "{from}");
+    }
+}
+
+#[tokio::test]
+async fn sdoc_normative_change_with_a_manual_bump_is_clean() {
+    let dir = sdoc_repo_with_staged_change(
+        "VERSION: 2\nTITLE: Export file name\nSTATUS: active\nVERIFIED_BY: test\nWHEN: an export file is created\nSYSTEM: the exporter\nKEYWORD: MUST",
+        "VERSION: 3\nTITLE: Export file name\nSTATUS: active\nVERIFIED_BY: test\nWHEN: an export file is created\nSYSTEM: the exporter\nKEYWORD: SHOULD",
+    );
+
+    assert!(pre_commit(dir.path(), &sdoc_config()).await.unwrap());
+}
+
+#[tokio::test]
+async fn sdoc_term_definition_change_needs_a_bump() {
+    let dir = sdoc_repo_with_staged_change(
+        "DEFINITION: The component that writes invoice exports.",
+        "DEFINITION: The service that writes invoice exports.",
+    );
+
+    let bumped = bump(dir.path(), &sdoc_config()).await.unwrap();
+    assert_eq!(bumped.len(), 1);
+    assert_eq!(bumped[0].base, "glossary.exporter");
+    assert!(staged_sdoc(dir.path()).contains("UID: glossary.exporter\nVERSION: 2\n"));
+}
+
+#[tokio::test]
+async fn sdoc_configured_normative_fields_replace_the_default_for_their_element() {
+    let dir = sdoc_repo_with_staged_change(
+        "RESPONSE: name it by tenant and period",
+        "RESPONSE: name it by tenant",
+    );
+    let config_path = dir.path().join("config.styx");
+    fs::write(
+        &config_path,
+        "specs (\n  {\n    name test\n    include (spec.sdoc)\n    format {\n      sdoc {\n        normative_fields {\n          FUNCTIONAL (element STATUS KEYWORD parent-relations)\n        }\n      }\n    }\n  }\n)\n",
+    )
+    .unwrap();
+    let config = tracey::load_config(&config_path).unwrap();
+    assert!(pre_commit(dir.path(), &config).await.unwrap());
+
+    let dir = sdoc_repo_with_staged_change("KEYWORD: MUST", "KEYWORD: SHOULD");
+    assert!(!pre_commit(dir.path(), &config).await.unwrap());
+}

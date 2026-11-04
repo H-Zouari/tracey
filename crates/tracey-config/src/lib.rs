@@ -61,6 +61,15 @@ pub struct SpecConfig {
 pub struct FormatConfig {
     #[facet(default)]
     pub typst: TypstFormatConfig,
+    #[facet(default)]
+    pub sdoc: SdocFormatConfig,
+}
+
+/// StrictDoc-backend options. Mirrors `tracey_core::NormativeFields`.
+#[derive(Debug, Clone, Default, Facet)]
+pub struct SdocFormatConfig {
+    #[facet(default)]
+    pub normative_fields: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Typst-backend options. Mirrors `tracey_core::TypstConfig` (string paths;

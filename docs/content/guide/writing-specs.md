@@ -220,7 +220,27 @@ TITLE: Parity rule
 STATEMENT: Client-initiated channels MUST use odd IDs, server-initiated channels MUST use even IDs.
 ```
 
-Every node with a `UID:` field becomes a requirement: `[REQUIREMENT]`, elements from a custom grammar (`[FEATURE]`, `[LOW_LEVEL_REQUIREMENT]`, …), and composite nodes (`[[COMPOSITE_REQUIREMENT]]` … `[[/COMPOSITE_REQUIREMENT]]`) together with the nodes nested inside them. Nodes without a `UID:` field are skipped silently; tracey can't reference a requirement it can't name. `[TEXT]` nodes are never requirements, but their text is shown in the rendered spec, and `[[SECTION]]`s become headings.
+Every node with a `UID:` field becomes a requirement: `[REQUIREMENT]`, elements from a custom grammar (`[FEATURE]`, `[FUNCTIONAL]`, …), and composite nodes (`[[COMPOSITE_REQUIREMENT]]` … `[[/COMPOSITE_REQUIREMENT]]`) together with the nodes nested inside them. Nodes without a `UID:` field are skipped silently; tracey can't reference a requirement it can't name. `[TEXT]` and `[TERM]` nodes are never requirements, but their text is shown in the rendered spec, and `[[SECTION]]`s become headings.
+
+**Versions.** A node's version is its `VERSION:` field (version 1 when absent). A UID must not carry a `+N` suffix; tracey reports an error naming it. Code references a later version with the usual suffix — `r[impl export.file.name+2]` — and a reference to an older version is stale. `@relation(...)` markers carry no version, so they are stale against any node past `VERSION: 1`.
+
+**Status.** `STATUS: retired` marks a node retired (`STATUS: active` is the normal case); nodes nested in a composite node inherit its status. Retired nodes don't count towards coverage, and a code reference to one is an error.
+
+**Flows.** A `[[FLOW]]` counts as verified when it has a current `verify` reference itself, or when every `[STEP]` inside it does.
+
+**Bumping.** `tracey bump` and `tracey pre-commit` work on `.sdoc` files too. A change to a node's normative fields requires its `VERSION` to increase by one; `tracey bump` does that in place and re-stages the file. A change to `TITLE` or `NOTES` only needs no bump. Normative fields default to the Fleet Spec Format's list (for a `[FUNCTIONAL]` node: the element, `STATUS`, `VERIFIED_BY`, `WHERE`, `WHILE`, `WHEN`, `IF`, `SYSTEM`, `KEYWORD`, `RESPONSE`, `ATTRIBUTES` and its `Parent` relations). Override it per element in the spec config; besides field names, `element`, `parent-relations` and `steps` (a composite node's children, in order) name the other parts of a node:
+
+```styx
+format {
+  sdoc {
+    normative_fields {
+      FUNCTIONAL (element STATUS VERIFIED_BY WHEN SYSTEM KEYWORD RESPONSE parent-relations)
+    }
+  }
+}
+```
+
+An element missing from the list counts its tag, every field except `UID`, `VERSION`, `TITLE` and `NOTES`, its relations and its children.
 
 **Source-side prefix.** `.sdoc` has no `PREFIX[…]` marker, so tracey uses the synthetic prefix `r` for these requirements. References from your code use the same `r[…]` syntax that markdown specs use, or — if you'd rather match StrictDoc's own conventions — the [`@relation(...)`](annotating-code.md#strictdoc-style-markers-relation) form.
 

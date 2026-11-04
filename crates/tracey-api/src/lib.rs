@@ -253,6 +253,8 @@ pub enum ValidationErrorCode {
     UnknownRequirement,
     /// Reference points to an older requirement version
     StaleRequirement,
+    /// Reference points to a retired requirement
+    RetiredRequirement,
     /// Duplicate requirement ID in the same spec
     DuplicateRequirement,
     /// Unknown prefix in reference

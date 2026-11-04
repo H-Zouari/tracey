@@ -31,11 +31,12 @@ pub use sources::{
     is_supported_extension,
 };
 pub use spec::{
-    BadgeFn, ErasedConfig, NoConfig, REQ_ANCHOR_PREFIX, RenderInput, RenderOutput, RenderSource,
-    RenderedSection, ReqDefinition, SlugAllocator, SpecBackend, SpecConfigs, SpecDoc, SpecFormat,
-    TypstConfig, diff_inline, extract_marker_prefix, id_range_in_marker, is_spec_extension,
-    parse_spec, parse_weight, render_spec_html, render_spec_inline, req_anchor_id,
-    req_anchor_to_id, rewrite_marker,
+    BadgeFn, ErasedConfig, NoConfig, NormativeFields, NormativeItem, REQ_ANCHOR_PREFIX,
+    RenderInput, RenderOutput, RenderSource, RenderedSection, ReqDefinition, SlugAllocator,
+    SpecBackend, SpecConfigs, SpecDoc, SpecFormat, TypstConfig, VersionedSdocNode, diff_inline,
+    extract_marker_prefix, id_range_in_marker, is_spec_extension, parse_spec, parse_weight,
+    render_spec_html, render_spec_inline, req_anchor_id, req_anchor_to_id, rewrite_marker,
+    sdoc_flow_steps, versioned_sdoc_nodes,
 };
 
 #[cfg(feature = "walk")]

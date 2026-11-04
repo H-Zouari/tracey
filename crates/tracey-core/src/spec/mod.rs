@@ -18,6 +18,9 @@ mod sdoc;
 pub mod typst;
 
 pub use registry::{ErasedConfig, NoConfig, SpecConfigs};
+pub use sdoc::{
+    NormativeFields, NormativeItem, VersionedSdocNode, sdoc_flow_steps, versioned_sdoc_nodes,
+};
 pub use typst::TypstConfig;
 
 // Re-export the marq types that callers interact with regardless of format.

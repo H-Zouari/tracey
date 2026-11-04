@@ -2,7 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- **StrictDoc versions come from the `VERSION` field.** A `.sdoc` node at
+  `VERSION: 2` is rule `uid+2`, so older code references are stale and
+  `@relation` markers are stale against it. `tracey bump` and
+  `tracey pre-commit` now work on `.sdoc` files: a change to a node's
+  normative fields needs its `VERSION` raised by one, which `tracey bump`
+  writes in place. Normative fields default to the Fleet Spec Format's list
+  and are configured per element with `format.sdoc.normative_fields`.
+- **Retired StrictDoc nodes.** `STATUS: retired` excludes a node from
+  coverage, and a code reference to it is a `RetiredRequirement` error.
+- **StrictDoc flows are verified through their steps**: a `[[FLOW]]` with no
+  `verify` reference of its own counts as verified when every `[STEP]` in it
+  has a current one.
+- **Stale references to StrictDoc nodes show what changed**: the node's
+  normative fields at the referenced version and now.
+
 ### Changed
+
+- **A `+N` suffix in a StrictDoc UID is an error**; the version belongs in
+  the `VERSION` field. Before, `UID: CH-001+2` was read as version 2.
+- **`[TERM]` StrictDoc nodes are no longer requirements.**
 
 - **`exclude` patterns are matched relative to the project root**, as the
   configuration guide documents. Before, they were matched relative to the

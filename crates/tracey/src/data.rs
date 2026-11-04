@@ -1252,6 +1252,7 @@ enum SourceDiagnosticIssueCode {
     UnknownPrefix,
     Stale { current_rule_id: RuleId },
     UnknownRequirement,
+    RetiredRequirement,
     ImplInTestFile,
     ParseWarning,
 }
@@ -1345,7 +1346,39 @@ fn collect_source_diagnostic_issues(
             .get(reference.prefix.as_str())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        match classify_reference_against_known_rules(&reference.req_id, known_for_prefix) {
+        let classification =
+            classify_reference_against_known_rules(&reference.req_id, known_for_prefix);
+        let retired_rule = match &classification {
+            KnownRuleMatch::Exact => Some(&reference.req_id),
+            KnownRuleMatch::Stale(current_rule_id) => Some(current_rule_id),
+            KnownRuleMatch::Missing => None,
+        }
+        .filter(|id| {
+            ctx.rules_by_id.get(*id).is_some_and(|rule| {
+                rule.status.as_deref() == Some(marq::ReqStatus::Removed.as_str())
+            })
+        })
+        .cloned();
+        match classification {
+            _ if retired_rule.is_some() => {
+                diagnostics.push(SourceDiagnosticIssue {
+                    code: SourceDiagnosticIssueCode::RetiredRequirement,
+                    message: format!(
+                        "Reference to retired rule '{}'",
+                        retired_rule
+                            .as_ref()
+                            .map(RuleId::to_string)
+                            .unwrap_or_default()
+                    ),
+                    line: reference.line,
+                    start_line,
+                    start_char,
+                    end_line,
+                    end_char,
+                    reference_rule_id: retired_rule.clone(),
+                    reference_text: None,
+                });
+            }
             KnownRuleMatch::Exact => {}
             KnownRuleMatch::Stale(current_rule_id) => {
                 let message = stale_diagnostic_message_short(
@@ -1434,6 +1467,7 @@ fn source_issue_to_lsp(issue: SourceDiagnosticIssue) -> LspDiagnostic {
         SourceDiagnosticIssueCode::UnknownPrefix => ("hint", "unknown-prefix"),
         SourceDiagnosticIssueCode::Stale { .. } => ("warning", "stale"),
         SourceDiagnosticIssueCode::UnknownRequirement => ("warning", "orphaned"),
+        SourceDiagnosticIssueCode::RetiredRequirement => ("error", "retired"),
         SourceDiagnosticIssueCode::ImplInTestFile => ("warning", "impl-in-test"),
         SourceDiagnosticIssueCode::ParseWarning => ("warning", "parse-warning"),
     };
@@ -1567,6 +1601,13 @@ fn compute_validation_by_impl(
                         SourceDiagnosticIssueCode::UnknownRequirement => {
                             (ValidationErrorCode::UnknownRequirement, Vec::new())
                         }
+                        SourceDiagnosticIssueCode::RetiredRequirement => (
+                            ValidationErrorCode::RetiredRequirement,
+                            issue
+                                .reference_rule_id
+                                .clone()
+                                .map_or_else(Vec::new, |id| vec![id]),
+                        ),
                         SourceDiagnosticIssueCode::ImplInTestFile => (
                             ValidationErrorCode::ImplInTestFile,
                             issue
@@ -2032,6 +2073,8 @@ fn compute_impl_output(
     }
 
     let mut api_rules = Vec::new();
+    let mut current_verify_refs: HashMap<String, Vec<ApiCodeRef>> = HashMap::new();
+    let mut flows: Vec<(usize, &[String])> = Vec::new();
     for extracted in extracted_rules {
         let Some(rule_id) = parse_rule_id(&extracted.def.id.to_string()) else {
             continue;
@@ -2050,7 +2093,13 @@ fn compute_impl_output(
             match classify_reference_for_rule(&rule_id, &entry.req_id) {
                 RuleIdMatch::Exact => match entry.verb {
                     RefVerb::Impl | RefVerb::Define => impl_refs.push(entry.code_ref.clone()),
-                    RefVerb::Verify => verify_refs.push(entry.code_ref.clone()),
+                    RefVerb::Verify => {
+                        verify_refs.push(entry.code_ref.clone());
+                        current_verify_refs
+                            .entry(rule_id.base.clone())
+                            .or_default()
+                            .push(entry.code_ref.clone());
+                    }
                     RefVerb::Depends | RefVerb::Related => {
                         depends_refs.push(entry.code_ref.clone())
                     }
@@ -2100,6 +2149,21 @@ fn compute_impl_output(
             is_stale: !stale_refs.is_empty(),
             stale_refs,
         });
+        if !extracted.steps.is_empty() {
+            flows.push((api_rules.len() - 1, &extracted.steps));
+        }
+    }
+    for (flow_idx, steps) in flows {
+        if current_verify_refs.contains_key(&api_rules[flow_idx].id.base)
+            || !steps.iter().all(|s| current_verify_refs.contains_key(s))
+        {
+            continue;
+        }
+        let through_steps = steps
+            .iter()
+            .flat_map(|s| current_verify_refs[s].iter().cloned())
+            .collect::<Vec<_>>();
+        api_rules[flow_idx].verify_refs.extend(through_steps);
     }
     api_rules.sort_by(|a, b| a.id.cmp(&b.id));
     let all_search_rules = extracted_rules

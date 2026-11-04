@@ -34,6 +34,8 @@ pub struct ExtractedRule {
     pub section: Option<String>,
     /// Section title (heading text) that this rule belongs to
     pub section_title: Option<String>,
+    /// For an SDoc flow, the base ids of its steps, in order.
+    pub steps: Vec<String>,
 }
 
 /// Compute 1-indexed column from byte offset in content
@@ -80,6 +82,12 @@ pub(crate) fn doc_to_extracted_rules(
         }
     }
 
+    let mut flow_steps: HashMap<String, Vec<String>> = if fmt == SpecFormat::Sdoc {
+        tracey_core::sdoc_flow_steps(content)?.into_iter().collect()
+    } else {
+        HashMap::new()
+    };
+
     let mut extracted = Vec::with_capacity(doc.reqs.len());
     for req in doc.reqs {
         let column = Some(compute_column(content, req.span.offset));
@@ -93,6 +101,7 @@ pub(crate) fn doc_to_extracted_rules(
         let (section, section_title) = rule_sections
             .remove(&req.id.to_string())
             .unwrap_or((None, None));
+        let steps = flow_steps.remove(&req.id.base).unwrap_or_default();
         extracted.push(ExtractedRule {
             def: req,
             source_file: display_path.to_string(),
@@ -101,6 +110,7 @@ pub(crate) fn doc_to_extracted_rules(
             column,
             section,
             section_title,
+            steps,
         });
     }
     Ok(extracted)

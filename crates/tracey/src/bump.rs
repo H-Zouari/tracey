@@ -6,11 +6,32 @@
 
 use eyre::{Result, WrapErr, bail};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use tracey_core::{SpecFormat, id_range_in_marker, parse_spec, rewrite_marker};
+use tracey_core::{
+    NormativeFields, SpecFormat, VersionedSdocNode, id_range_in_marker, parse_spec, rewrite_marker,
+    versioned_sdoc_nodes,
+};
 
-use crate::config::Config;
+use crate::config::{Config, SpecConfig};
+
+#[derive(Debug)]
+pub enum VersionEdit {
+    /// The `prefix[id]` marker, whose id gets a `+N` suffix.
+    Marker(marq::SourceSpan),
+    /// The value of an SDoc node's `VERSION` field.
+    SdocVersion(Range<usize>),
+}
+
+impl VersionEdit {
+    fn start(&self) -> usize {
+        match self {
+            VersionEdit::Marker(span) => span.offset,
+            VersionEdit::SdocVersion(range) => range.start,
+        }
+    }
+}
 
 /// A rule whose text changed in the staged index but whose version was not bumped.
 #[derive(Debug)]
@@ -26,9 +47,8 @@ pub struct ChangedRule {
     pub old_raw: String,
     /// Raw markdown text of the rule after the change (from index).
     pub new_raw: String,
-    /// Byte span of the `prefix[id]` marker in the **index** content.
-    /// Used to rewrite the version in-place.
-    pub marker_span: marq::SourceSpan,
+    /// Where to write the bumped version in the **index** content.
+    pub edit: VersionEdit,
 }
 
 /// Run a git command in the project root and capture stdout.
@@ -117,13 +137,6 @@ pub async fn detect_changed_rules(
         &["diff-index", "--name-only", "--cached", "HEAD"],
     )?;
 
-    // Collect all spec include patterns.
-    let spec_patterns: Vec<&str> = config
-        .specs
-        .iter()
-        .flat_map(|s| s.include.iter().map(String::as_str))
-        .collect();
-
     let mut changed_rules = Vec::new();
 
     for staged_file in staged_output.lines() {
@@ -133,13 +146,15 @@ pub async fn detect_changed_rules(
         }
 
         // Only consider files that match a spec include pattern.
-        if !spec_patterns.iter().any(|p| {
-            globset::Glob::new(p)
-                .map(|g| g.compile_matcher().is_match(staged_file))
-                .unwrap_or(false)
-        }) {
+        let Some(spec) = config.specs.iter().find(|s| {
+            s.include.iter().any(|p| {
+                globset::Glob::new(p)
+                    .map(|g| g.compile_matcher().is_match(staged_file))
+                    .unwrap_or(false)
+            })
+        }) else {
             continue;
-        }
+        };
 
         // Skip files whose extension is not a recognised spec format. A glob
         // like `docs/spec/**/*` could otherwise match images / data files.
@@ -152,6 +167,19 @@ pub async fn detect_changed_rules(
             Some(c) => c,
             None => continue, // deleted — nothing to check
         };
+
+        if fmt == SpecFormat::Sdoc {
+            let Some(old_content) = old_content else {
+                continue;
+            };
+            changed_rules.extend(changed_sdoc_nodes(
+                staged_file,
+                &old_content,
+                &new_content,
+                &normative_fields(spec),
+            )?);
+            continue;
+        }
 
         let old_rules = match old_content {
             Some(ref c) => parse_spec_rules(fmt, c).await?,
@@ -172,13 +200,66 @@ pub async fn detect_changed_rules(
                     rule_id: new_req.id.clone(),
                     old_raw: old_req.raw.clone(),
                     new_raw: new_req.raw.clone(),
-                    marker_span: new_req.marker_span,
+                    edit: VersionEdit::Marker(new_req.marker_span),
                 });
             }
         }
     }
 
     Ok(changed_rules)
+}
+
+fn normative_fields(spec: &SpecConfig) -> NormativeFields {
+    NormativeFields::with_overrides(
+        spec.format
+            .sdoc
+            .normative_fields
+            .iter()
+            .map(|(element, names)| (element.as_str(), names.as_slice())),
+    )
+}
+
+fn changed_sdoc_nodes(
+    file: &str,
+    old_content: &str,
+    new_content: &str,
+    fields: &NormativeFields,
+) -> Result<Vec<ChangedRule>> {
+    let old_nodes: HashMap<String, VersionedSdocNode> = versioned_sdoc_nodes(old_content, fields)
+        .wrap_err_with(|| format!("{file} at HEAD"))?
+        .into_iter()
+        .map(|node| (node.uid.clone(), node))
+        .collect();
+    let describe = |node: &VersionedSdocNode| {
+        node.normative
+            .iter()
+            .map(|(name, value)| format!("{name}: {}", value.as_deref().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let mut changed = Vec::new();
+    for new_node in versioned_sdoc_nodes(new_content, fields)
+        .wrap_err_with(|| format!("{file} in the index"))?
+    {
+        let Some(old_node) = old_nodes.get(&new_node.uid) else {
+            continue;
+        };
+        if new_node.normative != old_node.normative && new_node.version <= old_node.version {
+            changed.push(ChangedRule {
+                file: PathBuf::from(file),
+                format: SpecFormat::Sdoc,
+                rule_id: marq::RuleId {
+                    base: new_node.uid.clone(),
+                    version: old_node.version,
+                },
+                old_raw: describe(old_node),
+                new_raw: describe(&new_node),
+                edit: VersionEdit::SdocVersion(new_node.version_span.clone()),
+            });
+        }
+    }
+    Ok(changed)
 }
 
 /// Check staged spec changes and exit non-zero if any rule text changed without
@@ -193,10 +274,17 @@ pub async fn pre_commit(project_root: &Path, config: &Config) -> Result<bool> {
     }
 
     for change in &changes {
-        eprintln!(
-            "error: rule `{}` body changed but version was not bumped",
-            change.rule_id
-        );
+        if change.format == SpecFormat::Sdoc {
+            eprintln!(
+                "error: a normative field of `{}` changed but its VERSION did not increase",
+                change.rule_id.base
+            );
+        } else {
+            eprintln!(
+                "error: rule `{}` body changed but version was not bumped",
+                change.rule_id
+            );
+        }
         eprintln!("  file: {}", change.file.display());
     }
     eprintln!();
@@ -237,31 +325,28 @@ pub async fn bump(project_root: &Path, config: &Config) -> Result<Vec<marq::Rule
 
         // Sort indices so we apply edits from last byte offset to first.
         let mut sorted_indices = indices.clone();
-        sorted_indices.sort_by(|&a, &b| {
-            changes[b]
-                .marker_span
-                .offset
-                .cmp(&changes[a].marker_span.offset)
-        });
+        sorted_indices.sort_by_key(|&i| std::cmp::Reverse(changes[i].edit.start()));
 
         for &idx in &sorted_indices {
             let change = &changes[idx];
             let new_version = change.rule_id.version + 1;
 
-            // Extract the current marker text and rebuild it with the new version.
-            let span = change.marker_span;
-            let marker_bytes = &bytes[span.offset..span.offset + span.length];
-            let marker_str =
-                std::str::from_utf8(marker_bytes).wrap_err("marker is not valid UTF-8")?;
+            let (range, replacement) = match &change.edit {
+                VersionEdit::Marker(span) => {
+                    // Extract the current marker text and rebuild it with the new version.
+                    let range = span.offset..span.offset + span.length;
+                    let marker_str = std::str::from_utf8(&bytes[range.clone()])
+                        .wrap_err("marker is not valid UTF-8")?;
 
-            // Build the new marker, e.g. `r[auth.login+2]`.
-            let id_range = id_range_in_marker(fmt, marker_str)?;
-            let new_marker =
-                rewrite_marker(marker_str, id_range, &change.rule_id.base, new_version)?;
-
-            let start = span.offset;
-            let end = start + span.length;
-            bytes.splice(start..end, new_marker.into_bytes());
+                    // Build the new marker, e.g. `r[auth.login+2]`.
+                    let id_range = id_range_in_marker(fmt, marker_str)?;
+                    let new_marker =
+                        rewrite_marker(marker_str, id_range, &change.rule_id.base, new_version)?;
+                    (range, new_marker)
+                }
+                VersionEdit::SdocVersion(range) => (range.clone(), new_version.to_string()),
+            };
+            bytes.splice(range, replacement.into_bytes());
 
             bumped_ids.push(marq::RuleId {
                 base: change.rule_id.base.clone(),
