@@ -113,5 +113,6 @@ time = { workspace = true, features = ["formatting"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 vox = { workspace = true }
 walkdir = "2"

@@ -81,8 +81,8 @@ struct RebuildCoalesceState {
     pending_mark: u64,
 }
 
-// Reaching this means a watcher mark was never settled; a rebuild of a large
-// repository finishes well within it, and the request then gets the data it has.
+// A rebuild of a large repository finishes well within it. Reaching it means a mark
+// was never settled (a watcher restart loses its batch), so the marks are given up.
 const PENDING_CHANGES_MAX_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
@@ -124,9 +124,10 @@ impl PendingChanges {
         .await;
         if waited.is_err() {
             warn!(
-                "Waited {:?} for pending file changes (mark {}); serving current data",
+                "Gave up after {:?} waiting for pending file changes (mark {}); serving current data",
                 PENDING_CHANGES_MAX_WAIT, target
             );
+            self.apply(target);
         }
     }
 }
@@ -695,5 +696,29 @@ impl Engine {
                 "#},
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_never_settled_delays_only_the_requests_already_waiting() {
+        let pending = PendingChanges::default();
+        pending.mark();
+
+        let first = tokio::time::Instant::now();
+        pending.wait_until_applied().await;
+        assert_eq!(first.elapsed(), PENDING_CHANGES_MAX_WAIT);
+
+        let second = tokio::time::Instant::now();
+        pending.wait_until_applied().await;
+        assert_eq!(second.elapsed(), Duration::ZERO);
+
+        pending.mark();
+        let after_new_change = tokio::time::Instant::now();
+        pending.wait_until_applied().await;
+        assert_eq!(after_new_change.elapsed(), PENDING_CHANGES_MAX_WAIT);
     }
 }
