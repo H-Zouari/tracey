@@ -1,12 +1,7 @@
 name: Website
 
+# The fork has no Blacksmith runners; run by hand only.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'docs/**'
-      - '.config/dodeca.styx'
-      - '.github/workflows/website.yml'
   workflow_dispatch:
 
 permissions:

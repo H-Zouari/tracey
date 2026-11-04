@@ -1,11 +1,8 @@
 name: CI
 
+# The fork has no Blacksmith runners; run by hand only.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  merge_group:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
