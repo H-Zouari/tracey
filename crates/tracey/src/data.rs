@@ -1375,7 +1375,7 @@ fn compute_validation_by_impl(
     config_path: &Path,
     config: &ApiConfig,
     forward_by_impl: &BTreeMap<ImplKey, ApiSpecForward>,
-    reverse_by_impl: &BTreeMap<ImplKey, ApiReverseData>,
+    source_files_by_impl: &BTreeMap<ImplKey, BTreeSet<PathBuf>>,
     source_reqs_by_file: &BTreeMap<PathBuf, Reqs>,
     file_contents: &BTreeMap<PathBuf, String>,
     test_files: &std::collections::HashSet<PathBuf>,
@@ -1459,26 +1459,23 @@ fn compute_validation_by_impl(
             }
         }
 
-        if let Some(reverse_data) = reverse_by_impl.get(impl_key) {
-            for file_entry in &reverse_data.files {
-                let file_path = abs_root.join(&file_entry.path);
-                let canonical = file_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| file_path.clone());
-                let Some(reqs) = source_reqs_by_file
-                    .get(&canonical)
-                    .or_else(|| source_reqs_by_file.get(&file_path))
-                else {
+        if let Some(source_files) = source_files_by_impl.get(impl_key) {
+            for path in source_files {
+                let Some(reqs) = source_reqs_by_file.get(path) else {
                     continue;
                 };
-                let content = file_contents
-                    .get(&canonical)
-                    .or_else(|| file_contents.get(&file_path));
-                let Some(content) = content else {
+                if reqs.references.is_empty() {
+                    continue;
+                }
+                let Some(content) = file_contents.get(path) else {
                     continue;
                 };
+                let rel_path = path
+                    .strip_prefix(abs_root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| compute_relative_path(abs_root, path));
 
-                let is_test = test_files.contains(&file_path) || test_files.contains(&canonical);
+                let is_test = test_files.contains(path);
                 let issues = collect_source_diagnostic_issues(content, reqs, is_test, &source_ctx);
                 for issue in issues {
                     let (code, related_rules) = match issue.code {
@@ -1503,7 +1500,7 @@ fn compute_validation_by_impl(
                     errors.push(ValidationError {
                         code,
                         message: issue.message,
-                        file: Some(file_entry.path.clone()),
+                        file: Some(rel_path.clone()),
                         line: Some(issue.line),
                         column: Some(issue.start_char as usize + 1),
                         related_rules,
@@ -2164,6 +2161,7 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
     let mut all_file_contents: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut all_spec_file_contents: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut all_source_reqs_by_file: BTreeMap<PathBuf, Reqs> = BTreeMap::new();
+    let mut source_files_by_impl: BTreeMap<ImplKey, BTreeSet<PathBuf>> = BTreeMap::new();
     let mut all_search_rules: Vec<search::RuleEntry> = Vec::new();
     let mut total_extracted_rules = 0usize;
     let mut total_source_refs = 0usize;
@@ -2444,6 +2442,10 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
             for (path, content) in impl_file_contents {
                 all_file_contents.insert(path, content);
             }
+            source_files_by_impl.insert(
+                impl_key.clone(),
+                impl_source_reqs_by_file.keys().cloned().collect(),
+            );
             for (path, reqs) in impl_source_reqs_by_file {
                 all_source_reqs_by_file.entry(path).or_insert(reqs);
             }
@@ -2558,7 +2560,7 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
         config_path,
         &api_config,
         &forward_by_impl,
-        &reverse_by_impl,
+        &source_files_by_impl,
         &all_source_reqs_by_file,
         &all_file_contents,
         &test_files,

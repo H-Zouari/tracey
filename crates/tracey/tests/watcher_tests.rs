@@ -597,3 +597,49 @@ async fn test_rebuild_modify_source_file() {
         "Expected auth.login to have impl refs after modifying source"
     );
 }
+
+#[tokio::test]
+async fn test_validation_checks_files_without_code_units_in_their_own_impl_only() {
+    use tracey::daemon::Engine;
+    use tracey_proto::ValidationErrorCode;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let config_path = root.join(".config/tracey/config.styx");
+    let files = [
+        (
+            ".config/tracey/config.styx",
+            "specs (\n  {\n    name test\n    include (spec.md)\n    impls (\n      {\n        name rust\n        include (src/**/*.rs)\n      }\n      {\n        name web\n        include (web/**/*.ts)\n      }\n    )\n  }\n)\n",
+        ),
+        ("spec.md", "# Spec\n\nr[auth.login]\nUsers must log in.\n"),
+        ("src/lib.rs", "pub fn placeholder() {}\n"),
+        (
+            "web/handlers.ts",
+            "// r[impl auth.missing]\nexport const handler = () => 1;\n",
+        ),
+    ];
+    for (path, content) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create dir");
+        std::fs::write(path, content).expect("write");
+    }
+
+    let engine = Engine::new(root.to_path_buf(), config_path)
+        .await
+        .expect("engine");
+    let data = engine.data().await;
+    let unknown_requirement_files = |impl_name: &str| -> Vec<Option<String>> {
+        data.validation_by_impl[&("test".to_string(), impl_name.to_string())]
+            .errors
+            .iter()
+            .filter(|e| e.code == ValidationErrorCode::UnknownRequirement)
+            .map(|e| e.file.clone())
+            .collect()
+    };
+
+    assert_eq!(
+        unknown_requirement_files("web"),
+        [Some("web/handlers.ts".to_string())]
+    );
+    assert_eq!(unknown_requirement_files("rust"), Vec::<Option<String>>::new());
+}
