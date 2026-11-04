@@ -203,7 +203,7 @@ vox = "0.9.0-rc.0"
 vox-schema = "0.9.0-rc.0"
 
 [patch.crates-io]
-marq = { git = "https://github.com/H-Zouari/marq", branch = "list-table-reqs" }
+marq = { git = "https://github.com/H-Zouari/marq", branch = "main" }
 
 # The profile that 'dist' will build with
 [profile.dist]
