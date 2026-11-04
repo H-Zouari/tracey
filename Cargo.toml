@@ -202,6 +202,9 @@ tempfile = "3.24.0"
 vox = "0.9.0-rc.0"
 vox-schema = "0.9.0-rc.0"
 
+[patch.crates-io]
+marq = { git = "https://github.com/H-Zouari/marq", branch = "list-table-reqs" }
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

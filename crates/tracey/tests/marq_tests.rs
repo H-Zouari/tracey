@@ -159,6 +159,44 @@ async fn test_tantivy_snippet_output() {
     );
 }
 
+#[tokio::test]
+async fn test_markdown_spec_reads_list_item_and_table_requirements() {
+    use tracey_core::{SpecFormat, parse_spec};
+
+    let spec = "\
+# Spec
+
+- r[list.a] A list item requirement.
+- r[list.b] Another one.
+
+r[table.whole]
+| Level | Meaning |
+|-------|---------|
+| 1     | low     |
+
+| Id | Rule |
+|----|------|
+| r[table.row] | A row requirement. |
+";
+    let doc = parse_spec(SpecFormat::Markdown, spec).await.expect("parse");
+
+    let found: Vec<(String, usize)> = doc
+        .reqs
+        .iter()
+        .map(|r| (r.id.to_string(), r.line))
+        .collect();
+    let line_of = |needle: &str| spec[..spec.find(needle).unwrap()].matches('\n').count() + 1;
+    assert_eq!(
+        found,
+        [
+            ("list.a".to_string(), line_of("r[list.a]")),
+            ("list.b".to_string(), line_of("r[list.b]")),
+            ("table.whole".to_string(), line_of("r[table.whole]")),
+            ("table.row".to_string(), line_of("r[table.row]")),
+        ]
+    );
+}
+
 /// Test helper that mirrors `crate::search::tantivy_impl::insert_mark_tags`
 /// (which is private to the `search` module).
 fn insert_mark_tags_test(content: &str, ranges: &[std::ops::Range<usize>]) -> String {
