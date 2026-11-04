@@ -100,9 +100,10 @@ vox = { workspace = true }
 dirs = { workspace = true }
 
 [features]
-default = ["search", "typst-spec"]
+default = ["search", "typst-spec", "dashboard"]
 search = ["dep:tantivy"]
 typst-spec = ["tracey-core/typst-spec"]
+dashboard = []
 
 [build-dependencies]
 tracey-api = { workspace = true }

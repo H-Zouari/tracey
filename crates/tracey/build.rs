@@ -32,7 +32,9 @@ fn main() {
     generate_typescript_types();
 
     // Build dashboard (after TS types are generated)
-    build_dashboard();
+    if std::env::var_os("CARGO_FEATURE_DASHBOARD").is_some() {
+        build_dashboard();
+    }
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {

@@ -199,12 +199,24 @@ pub async fn run(
 }
 
 // Embedded dashboard assets (built into OUT_DIR by build.rs)
+#[cfg(feature = "dashboard")]
 static INDEX_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/dashboard/dist/index.html"));
+#[cfg(feature = "dashboard")]
 pub(crate) static INDEX_CSS: &str =
     include_str!(concat!(env!("OUT_DIR"), "/dashboard/dist/assets/index.css"));
+#[cfg(feature = "dashboard")]
 #[allow(dead_code)]
 pub(crate) static INDEX_JS: &str =
     include_str!(concat!(env!("OUT_DIR"), "/dashboard/dist/assets/index.js"));
+
+#[cfg(not(feature = "dashboard"))]
+static INDEX_HTML: &str =
+    "<p>This tracey was built without the dashboard feature. The API under /api still works.</p>";
+#[cfg(not(feature = "dashboard"))]
+pub(crate) static INDEX_CSS: &str = "";
+#[cfg(not(feature = "dashboard"))]
+#[allow(dead_code)]
+pub(crate) static INDEX_JS: &str = "";
 
 /// SPA fallback - serve index.html for all non-API routes.
 async fn spa_fallback() -> Html<&'static str> {
