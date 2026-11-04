@@ -4,26 +4,39 @@ on:
   push:
     tags: ["fleet-r*"]
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   linux-x86_64:
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: 1.99.1
+          persist-credentials: false
+      - run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
       - run: cargo build --release --locked -p tracey --no-default-features
       - run: |
           mkdir dist
           cp target/release/tracey dist/tracey-x86_64-linux
           strip dist/tracey-x86_64-linux
           cd dist && sha256sum tracey-x86_64-linux > tracey-x86_64-linux.sha256
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/tracey-x86_64-linux
       - env:
           GH_TOKEN: ${{ github.token }}
         run: >
           gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
           --title "$GITHUB_REF_NAME"
           --notes "tracey at $GITHUB_SHA for x86_64 Linux, built without the dashboard, search and Typst features."
