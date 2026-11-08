@@ -472,7 +472,15 @@ impl NormativeFields {
             (
                 "FUNCTIONAL",
                 requirement(&[
-                    "WHERE", "WHILE", "WHEN", "IF", "SYSTEM", "KEYWORD", "RESPONSE",
+                    "WHERE",
+                    "WHILE",
+                    "WHEN",
+                    "IF",
+                    "SYSTEM",
+                    "KEYWORD",
+                    "RESPONSE",
+                    "OTHERWISE",
+                    "EXAMPLES",
                 ]),
             ),
             (
@@ -885,6 +893,34 @@ RELATIONS:\n- TYPE: Parent\n  VALUE: export.file.csv\n  ROLE: Uses\n\n\
         let rerolled = with_field(FLEET_DOC, "ROLE: Refines", "ROLE: Uses");
         assert_ne!(normative(&reworded), before);
         assert_ne!(normative(&rerolled), before);
+    }
+
+    #[test]
+    fn otherwise_and_examples_of_a_functional_rule_are_normative() {
+        let fields = NormativeFields::fleet();
+        let normative = |content: &str| {
+            node(
+                &versioned_sdoc_nodes(content, &fields).unwrap(),
+                "export.file.name",
+            )
+            .normative
+            .clone()
+        };
+        let with_both = with_field(
+            FLEET_DOC,
+            "RESPONSE: name it by period\n",
+            "RESPONSE: name it by period\nOTHERWISE: name it export.csv\nEXAMPLES: 2026-03.csv\n",
+        );
+        let before = normative(&with_both);
+
+        let otherwise = with_field(
+            &with_both,
+            "OTHERWISE: name it export.csv",
+            "OTHERWISE: refuse the export",
+        );
+        let examples = with_field(&with_both, "EXAMPLES: 2026-03.csv", "EXAMPLES: march.csv");
+        assert_ne!(normative(&otherwise), before);
+        assert_ne!(normative(&examples), before);
     }
 
     #[test]

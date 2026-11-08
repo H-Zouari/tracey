@@ -228,7 +228,7 @@ Every node with a `UID:` field becomes a requirement: `[REQUIREMENT]`, elements 
 
 **Flows.** A `[[FLOW]]` counts as verified when it has a current `verify` reference itself, or when every `[STEP]` inside it does.
 
-**Bumping.** `tracey bump` and `tracey pre-commit` work on `.sdoc` files too. A change to a node's normative fields requires its `VERSION` to increase by one; `tracey bump` does that in place and re-stages the file. A change to `TITLE` or `NOTES` only needs no bump. Normative fields default to the Fleet Spec Format's list (for a `[FUNCTIONAL]` node: the element, `STATUS`, `VERIFIED_BY`, `WHERE`, `WHILE`, `WHEN`, `IF`, `SYSTEM`, `KEYWORD`, `RESPONSE`, `ATTRIBUTES` and its `Parent` relations). Override it per element in the spec config; besides field names, `element`, `parent-relations` and `steps` (a composite node's children, in order) name the other parts of a node:
+**Bumping.** `tracey bump` and `tracey pre-commit` work on `.sdoc` files too. A change to a node's normative fields requires its `VERSION` to increase by one; `tracey bump` does that in place and re-stages the file. A change to `TITLE` or `NOTES` only needs no bump. Normative fields default to the Fleet Spec Format's list (for a `[FUNCTIONAL]` node: the element, `STATUS`, `VERIFIED_BY`, `WHERE`, `WHILE`, `WHEN`, `IF`, `SYSTEM`, `KEYWORD`, `RESPONSE`, `OTHERWISE`, `EXAMPLES`, `ATTRIBUTES` and its `Parent` relations). Override it per element in the spec config; besides field names, `element`, `parent-relations` and `steps` (a composite node's children, in order) name the other parts of a node:
 
 ```styx
 format {
