@@ -18,7 +18,7 @@ pub use tracey_proto::TraceyDaemonClient;
 #[derive(Clone)]
 pub struct DaemonClient {
     project_root: PathBuf,
-    in_process: Option<std::sync::Arc<tokio::sync::OnceCell<super::TraceyService>>>,
+    in_process: Option<std::sync::Arc<tokio::sync::OnceCell<TraceyDaemonClient>>>,
 }
 
 /// Create a new daemon client for the given project root.
@@ -39,34 +39,33 @@ pub fn new_in_process_client(project_root: PathBuf) -> DaemonClient {
 impl DaemonClient {
     async fn in_process_client(
         &self,
-        service: &tokio::sync::OnceCell<super::TraceyService>,
+        cell: &tokio::sync::OnceCell<TraceyDaemonClient>,
     ) -> io::Result<TraceyDaemonClient> {
-        let service = service
-            .get_or_try_init(|| async {
-                let config = self.project_root.join(".config/tracey/config.styx");
-                let engine = super::Engine::new(self.project_root.clone(), config)
+        cell.get_or_try_init(|| async {
+            let config = self.project_root.join(".config/tracey/config.styx");
+            let engine = super::Engine::new(self.project_root.clone(), config)
+                .await
+                .map_err(|e| io::Error::other(format!("{e:?}")))?;
+            let service = super::TraceyService::new(std::sync::Arc::new(engine));
+            let (ours, theirs) = vox::memory_link_pair(64);
+            tokio::spawn(async move {
+                let dispatcher = super::service::TraceyDaemonDispatcher::new(service);
+                if let Ok(guard) = vox::acceptor_on(theirs)
+                    .on_connection(dispatcher)
+                    .establish::<TraceyDaemonClient>()
                     .await
-                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
-                Ok::<_, io::Error>(super::TraceyService::new(std::sync::Arc::new(engine)))
-            })
-            .await?
-            .clone();
-        let (ours, theirs) = vox::memory_link_pair(64);
-        tokio::spawn(async move {
-            let dispatcher = super::service::TraceyDaemonDispatcher::new(service);
-            if let Ok(guard) = vox::acceptor_on(theirs)
-                .on_connection(dispatcher)
+                {
+                    std::future::pending::<()>().await;
+                    drop(guard);
+                }
+            });
+            vox::initiator_on(ours)
                 .establish::<TraceyDaemonClient>()
                 .await
-            {
-                std::future::pending::<()>().await;
-                drop(guard);
-            }
-        });
-        vox::initiator_on(ours)
-            .establish::<TraceyDaemonClient>()
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))
+                .map_err(|e| io::Error::other(e.to_string()))
+        })
+        .await
+        .cloned()
     }
 
     async fn connect_inner(&self) -> io::Result<vox::transport::local::LocalLink> {
