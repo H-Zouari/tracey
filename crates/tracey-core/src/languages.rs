@@ -22,8 +22,15 @@ pub struct Lang {
     pub extensions: &'static [&'static str],
     /// Tree-sitter grammar for comment-aware ref extraction.
     pub grammar: fn() -> arborium_tree_sitter::LanguageFn,
-    /// Walks a parsed tree for structural units (functions, types, etc.) for reverse coverage.
-    pub walk: fn(&Path, &str, arborium_tree_sitter::Node, &mut CodeUnits),
+    /// Walks a parsed tree for structural units (functions, types, etc.) for reverse coverage,
+    /// and pushes every comment node of that tree onto the last argument.
+    pub walk: for<'t> fn(
+        &Path,
+        &str,
+        arborium_tree_sitter::Node<'t>,
+        &mut CodeUnits,
+        &mut Vec<arborium_tree_sitter::Node<'t>>,
+    ),
     pub injections: Option<&'static str>,
 }
 

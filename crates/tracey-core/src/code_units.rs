@@ -166,37 +166,39 @@ fn units_with(
     path: &Path,
     source: &str,
     grammar: fn() -> arborium_tree_sitter::LanguageFn,
-    walk: fn(&Path, &str, Node, &mut CodeUnits),
+    walk: for<'t> fn(&Path, &str, Node<'t>, &mut CodeUnits, &mut Vec<Node<'t>>),
 ) -> CodeUnits {
     let mut units = CodeUnits::new();
     if let Some(tree) = parse(&grammar().into(), source) {
-        walk(path, source, tree.root_node(), &mut units);
+        walk(path, source, tree.root_node(), &mut units, &mut Vec::new());
     }
     units
 }
 
-fn units_of_tree(
+fn units_and_comments_of_tree<'t>(
     path: &Path,
     source: &str,
     lang: &Lang,
-    root: Node,
-    injections: &[crate::injections::Injection],
-) -> CodeUnits {
+    root: Node<'t>,
+    injections: &'t [crate::injections::Injection],
+) -> (CodeUnits, Vec<Node<'t>>) {
     let mut units = CodeUnits::new();
-    (lang.walk)(path, source, root, &mut units);
+    let mut comments = Vec::new();
+    (lang.walk)(path, source, root, &mut units, &mut comments);
     for injection in injections {
         extract_units_recursive(
             path,
             source,
             injection.tree.root_node(),
             &mut units,
+            &mut comments,
             injection.lang.node_kind,
         );
     }
     if !injections.is_empty() {
         units.units.sort_by_key(|u| u.start_byte);
     }
-    units
+    (units, comments)
 }
 
 /// Extract code units from source code, auto-detecting language from file extension
@@ -217,8 +219,9 @@ pub fn extract_file(path: &Path, source: &str) -> (CodeUnits, ExtractedRefs) {
         .injections
         .map(|query| parse_injections(query, &language, tree.root_node(), source))
         .unwrap_or_default();
-    let units = units_of_tree(path, source, lang, tree.root_node(), &injections);
-    (units, refs_of_tree(source, tree.root_node(), &injections))
+    let (units, comments) =
+        units_and_comments_of_tree(path, source, lang, tree.root_node(), &injections);
+    (units, refs_of_comments(source, comments))
 }
 
 /// No-op code-unit extractor for config/data languages (YAML, JSON5).
@@ -231,15 +234,29 @@ pub fn extract_config(_path: &Path, _source: &str) -> CodeUnits {
     CodeUnits::new()
 }
 
-pub(crate) fn walk_config(_path: &Path, _source: &str, _root: Node, _units: &mut CodeUnits) {}
+pub(crate) fn walk_config<'t>(
+    _path: &Path,
+    _source: &str,
+    root: Node<'t>,
+    _units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    collect_comment_nodes(root, comments);
+}
 
 /// Extract code units from Rust source code
 pub fn extract_rust(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_rust::language, walk_rust)
 }
 
-pub(crate) fn walk_rust(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, rust_node_kind);
+pub(crate) fn walk_rust<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, rust_node_kind);
 }
 
 /// Extract code units from Swift source code
@@ -247,8 +264,14 @@ pub fn extract_swift(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_swift::language, walk_swift)
 }
 
-pub(crate) fn walk_swift(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, swift_node_kind);
+pub(crate) fn walk_swift<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, swift_node_kind);
 }
 
 /// Extract code units from Go source code
@@ -256,8 +279,14 @@ pub fn extract_go(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_go::language, walk_go)
 }
 
-pub(crate) fn walk_go(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, go_node_kind);
+pub(crate) fn walk_go<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, go_node_kind);
 }
 
 /// Extract code units from Java source code
@@ -265,8 +294,14 @@ pub fn extract_java(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_java::language, walk_java)
 }
 
-pub(crate) fn walk_java(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, java_node_kind);
+pub(crate) fn walk_java<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, java_node_kind);
 }
 
 /// Extract code units from Python source code
@@ -274,8 +309,14 @@ pub fn extract_python(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_python::language, walk_python)
 }
 
-pub(crate) fn walk_python(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, python_node_kind);
+pub(crate) fn walk_python<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, python_node_kind);
 }
 
 /// Extract code units from TypeScript source code
@@ -283,8 +324,14 @@ pub fn extract_typescript(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_typescript::language, walk_typescript)
 }
 
-pub(crate) fn walk_typescript(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, typescript_node_kind);
+pub(crate) fn walk_typescript<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, typescript_node_kind);
 }
 
 // Language-specific node kind mappings
@@ -396,8 +443,14 @@ pub fn extract_php(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_php::language, walk_php)
 }
 
-pub(crate) fn walk_php(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, php_node_kind);
+pub(crate) fn walk_php<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, php_node_kind);
 }
 
 /// Extract code units from C source code
@@ -405,8 +458,14 @@ pub fn extract_c(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_c::language, walk_c)
 }
 
-pub(crate) fn walk_c(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, c_node_kind);
+pub(crate) fn walk_c<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, c_node_kind);
 }
 
 /// Extract code units from C++ source code
@@ -414,8 +473,14 @@ pub fn extract_cpp(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_cpp::language, walk_cpp)
 }
 
-pub(crate) fn walk_cpp(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, cpp_node_kind);
+pub(crate) fn walk_cpp<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, cpp_node_kind);
 }
 
 /// Extract code units from Ruby source code
@@ -423,8 +488,14 @@ pub fn extract_ruby(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_ruby::language, walk_ruby)
 }
 
-pub(crate) fn walk_ruby(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, ruby_node_kind);
+pub(crate) fn walk_ruby<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, ruby_node_kind);
 }
 
 fn ruby_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -441,8 +512,14 @@ pub fn extract_r(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_r::language, walk_r)
 }
 
-pub(crate) fn walk_r(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, r_node_kind);
+pub(crate) fn walk_r<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, r_node_kind);
 }
 
 fn r_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -457,8 +534,14 @@ pub fn extract_dart(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_dart::language, walk_dart)
 }
 
-pub(crate) fn walk_dart(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, dart_node_kind);
+pub(crate) fn walk_dart<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, dart_node_kind);
 }
 
 fn dart_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -477,8 +560,14 @@ pub fn extract_lua(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_lua::language, walk_lua)
 }
 
-pub(crate) fn walk_lua(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, lua_node_kind);
+pub(crate) fn walk_lua<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, lua_node_kind);
 }
 
 fn lua_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -493,8 +582,14 @@ pub fn extract_asm(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_asm::language, walk_asm)
 }
 
-pub(crate) fn walk_asm(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, asm_node_kind);
+pub(crate) fn walk_asm<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, asm_node_kind);
 }
 
 fn asm_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -510,8 +605,14 @@ pub fn extract_matlab(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_matlab::language, walk_matlab)
 }
 
-pub(crate) fn walk_matlab(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, matlab_node_kind);
+pub(crate) fn walk_matlab<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, matlab_node_kind);
 }
 
 fn matlab_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -527,8 +628,14 @@ pub fn extract_perl(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_perl::language, walk_perl)
 }
 
-pub(crate) fn walk_perl(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, perl_node_kind);
+pub(crate) fn walk_perl<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, perl_node_kind);
 }
 
 fn perl_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -549,8 +656,14 @@ pub fn extract_haskell(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_haskell::language, walk_haskell)
 }
 
-pub(crate) fn walk_haskell(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, haskell_node_kind);
+pub(crate) fn walk_haskell<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, haskell_node_kind);
 }
 
 fn haskell_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -573,8 +686,15 @@ pub fn extract_elixir(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_elixir::language, walk_elixir)
 }
 
-pub(crate) fn walk_elixir(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+pub(crate) fn walk_elixir<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
     extract_elixir_recursive(path, source, root, units);
+    collect_comment_nodes(root, comments);
 }
 
 fn elixir_call_kind(source: &str, node: Node) -> Option<CodeUnitKind> {
@@ -637,8 +757,14 @@ pub fn extract_erlang(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_erlang::language, walk_erlang)
 }
 
-pub(crate) fn walk_erlang(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, erlang_node_kind);
+pub(crate) fn walk_erlang<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, erlang_node_kind);
 }
 
 fn erlang_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -656,8 +782,15 @@ pub fn extract_clojure(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_clojure::language, walk_clojure)
 }
 
-pub(crate) fn walk_clojure(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+pub(crate) fn walk_clojure<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
     extract_clojure_recursive(path, source, root, units);
+    collect_comment_nodes(root, comments);
 }
 
 fn clojure_list_kind(source: &str, node: Node) -> Option<CodeUnitKind> {
@@ -722,8 +855,14 @@ pub fn extract_fsharp(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_fsharp::language, walk_fsharp)
 }
 
-pub(crate) fn walk_fsharp(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, fsharp_node_kind);
+pub(crate) fn walk_fsharp<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, fsharp_node_kind);
 }
 
 fn fsharp_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -740,8 +879,14 @@ pub fn extract_vb(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_vb::language, walk_vb)
 }
 
-pub(crate) fn walk_vb(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, vb_node_kind);
+pub(crate) fn walk_vb<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, vb_node_kind);
 }
 
 fn vb_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -759,8 +904,14 @@ pub fn extract_cobol(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_cobol::language, walk_cobol)
 }
 
-pub(crate) fn walk_cobol(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, cobol_node_kind);
+pub(crate) fn walk_cobol<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, cobol_node_kind);
 }
 
 fn cobol_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -776,8 +927,14 @@ pub fn extract_julia(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_julia::language, walk_julia)
 }
 
-pub(crate) fn walk_julia(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, julia_node_kind);
+pub(crate) fn walk_julia<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, julia_node_kind);
 }
 
 fn julia_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -797,8 +954,14 @@ pub fn extract_d(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_d::language, walk_d)
 }
 
-pub(crate) fn walk_d(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, d_node_kind);
+pub(crate) fn walk_d<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, d_node_kind);
 }
 
 fn d_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -816,8 +979,14 @@ pub fn extract_powershell(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_powershell::language, walk_powershell)
 }
 
-pub(crate) fn walk_powershell(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, powershell_node_kind);
+pub(crate) fn walk_powershell<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, powershell_node_kind);
 }
 
 fn powershell_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -834,8 +1003,14 @@ pub fn extract_cmake(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_cmake::language, walk_cmake)
 }
 
-pub(crate) fn walk_cmake(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, cmake_node_kind);
+pub(crate) fn walk_cmake<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, cmake_node_kind);
 }
 
 fn cmake_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -851,8 +1026,14 @@ pub fn extract_ocaml(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_ocaml::language, walk_ocaml)
 }
 
-pub(crate) fn walk_ocaml(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, ocaml_node_kind);
+pub(crate) fn walk_ocaml<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, ocaml_node_kind);
 }
 
 fn ocaml_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -869,8 +1050,14 @@ pub fn extract_bash(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_bash::language, walk_bash)
 }
 
-pub(crate) fn walk_bash(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, bash_node_kind);
+pub(crate) fn walk_bash<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, bash_node_kind);
 }
 
 fn bash_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -885,8 +1072,14 @@ pub fn extract_nix(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_nix::language, walk_nix)
 }
 
-pub(crate) fn walk_nix(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, nix_node_kind);
+pub(crate) fn walk_nix<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, nix_node_kind);
 }
 
 fn nix_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -902,8 +1095,14 @@ pub fn extract_lean(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_lean::language, walk_lean)
 }
 
-pub(crate) fn walk_lean(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, lean_node_kind);
+pub(crate) fn walk_lean<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, lean_node_kind);
 }
 
 fn lean_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -923,8 +1122,14 @@ pub fn extract_svelte(path: &Path, source: &str) -> CodeUnits {
     units_with(path, source, arborium_svelte::language, walk_svelte)
 }
 
-pub(crate) fn walk_svelte(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
-    extract_units_recursive(path, source, root, units, svelte_node_kind);
+pub(crate) fn walk_svelte<'t>(
+    path: &Path,
+    source: &str,
+    root: Node<'t>,
+    units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
+) {
+    extract_units_recursive(path, source, root, units, comments, svelte_node_kind);
 }
 
 fn svelte_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -935,18 +1140,23 @@ fn svelte_node_kind(kind: &str) -> Option<CodeUnitKind> {
     }
 }
 
-fn extract_units_recursive<F>(
+fn extract_units_recursive<'t, F>(
     path: &Path,
     source: &str,
-    node: Node,
+    node: Node<'t>,
     units: &mut CodeUnits,
+    comments: &mut Vec<Node<'t>>,
     node_kind_mapper: F,
 ) where
     F: Fn(&str) -> Option<CodeUnitKind> + Copy,
 {
     let mut cursor = node.walk();
     loop {
-        if let Some(unit) = node_to_code_unit(path, source, cursor.node(), &node_kind_mapper) {
+        let current = cursor.node();
+        if is_comment_kind(current.kind()) {
+            comments.push(current);
+        }
+        if let Some(unit) = node_to_code_unit(path, source, current, &node_kind_mapper) {
             units.units.push(unit);
         }
         if cursor.goto_first_child() {
@@ -1305,19 +1515,15 @@ pub fn extract_refs_with_warnings(path: &Path, source: &str) -> ExtractedRefs {
         .injections
         .map(|query| parse_injections(query, &language, tree.root_node(), source))
         .unwrap_or_default();
-    refs_of_tree(source, tree.root_node(), &injections)
-}
-
-fn refs_of_tree(
-    source: &str,
-    root: Node,
-    injections: &[crate::injections::Injection],
-) -> ExtractedRefs {
     let mut comments = Vec::new();
-    collect_comment_nodes(root, &mut comments);
-    for injection in injections {
+    collect_comment_nodes(tree.root_node(), &mut comments);
+    for injection in &injections {
         collect_comment_nodes(injection.tree.root_node(), &mut comments);
     }
+    refs_of_comments(source, comments)
+}
+
+fn refs_of_comments(source: &str, mut comments: Vec<Node>) -> ExtractedRefs {
     // Ignore directives apply in file order, and the host and each injected region are separate trees.
     comments.sort_by_key(|node| node.start_byte());
 
