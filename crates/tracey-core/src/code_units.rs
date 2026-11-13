@@ -944,15 +944,19 @@ fn extract_units_recursive<F>(
 ) where
     F: Fn(&str) -> Option<CodeUnitKind> + Copy,
 {
-    // Check if this node is a code unit we care about
-    if let Some(unit) = node_to_code_unit(path, source, node, &node_kind_mapper) {
-        units.units.push(unit);
-    }
-
-    // Recurse into children
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        extract_units_recursive(path, source, child, units, node_kind_mapper);
+    loop {
+        if let Some(unit) = node_to_code_unit(path, source, cursor.node(), &node_kind_mapper) {
+            units.units.push(unit);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
     }
 }
 
@@ -1098,49 +1102,32 @@ fn extract_req_refs_from_comments(source: &str, node: Node) -> (Vec<RuleId>, Opt
     let mut refs = Vec::new();
     let mut earliest_comment_line: Option<usize> = None;
 
-    // Look for comments that precede this node
-    // Collect all siblings before this node, then walk backwards to find consecutive comments
-    if let Some(parent) = node.parent() {
-        let mut cursor = parent.walk();
-        let mut preceding_siblings: Vec<Node> = Vec::new();
-
-        for child in parent.children(&mut cursor) {
-            if child.id() == node.id() {
-                break;
-            }
-            preceding_siblings.push(child);
+    let mut preceding = node.prev_sibling();
+    while let Some(sibling) = preceding {
+        // r[impl code-unit.boundary.include-comments]
+        // Different languages use different node kinds for comments:
+        // - Rust: line_comment, block_comment, attribute_item
+        // - Swift/Go/TypeScript: comment
+        // - Python: comment
+        let is_comment_like = matches!(
+            sibling.kind(),
+            "line_comment"
+                | "block_comment"
+                | "comment"
+                | "attribute_item"
+                | "decorator"       // Python decorators
+                | "multiline_comment"
+                | "bracket_comment"        // CMake
+                | "documentation_comment" // Dart
+        );
+        if !is_comment_like {
+            break;
         }
-
-        // Walk backwards through preceding siblings, collecting comments
-        // Stop when we hit something that's not a comment or attribute
-        for sibling in preceding_siblings.into_iter().rev() {
-            // r[impl code-unit.boundary.include-comments]
-            // Different languages use different node kinds for comments:
-            // - Rust: line_comment, block_comment, attribute_item
-            // - Swift/Go/TypeScript: comment
-            // - Python: comment
-            let is_comment_like = matches!(
-                sibling.kind(),
-                "line_comment"
-                    | "block_comment"
-                    | "comment"
-                    | "attribute_item"
-                    | "decorator"       // Python decorators
-                    | "multiline_comment"
-                    | "bracket_comment"        // CMake
-                    | "documentation_comment" // Dart
-            );
-            if is_comment_like {
-                collect_comment_refs(source, sibling, &mut refs);
-                // Track the earliest comment line (1-indexed)
-                let sibling_line = sibling.start_position().row + 1;
-                earliest_comment_line =
-                    Some(earliest_comment_line.map_or(sibling_line, |l| l.min(sibling_line)));
-            } else {
-                // Stop at first non-comment node
-                break;
-            }
-        }
+        collect_comment_refs(source, sibling, &mut refs);
+        let sibling_line = sibling.start_position().row + 1;
+        earliest_comment_line =
+            Some(earliest_comment_line.map_or(sibling_line, |l| l.min(sibling_line)));
+        preceding = sibling.prev_sibling();
     }
 
     // Check for doc comments and inner comments that are children of this node
@@ -1441,15 +1428,20 @@ fn is_comment_kind(kind: &str) -> bool {
 }
 
 fn collect_comment_nodes<'tree>(node: Node<'tree>, comments: &mut Vec<Node<'tree>>) {
-    // Check if this is a comment node
-    if is_comment_kind(node.kind()) {
-        comments.push(node);
-    }
-
-    // Recurse into children
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_comment_nodes(child, comments);
+    loop {
+        let current = cursor.node();
+        if is_comment_kind(current.kind()) {
+            comments.push(current);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
     }
 }
 

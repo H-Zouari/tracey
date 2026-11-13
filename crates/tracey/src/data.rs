@@ -681,7 +681,6 @@ struct WalkedFile {
     is_symlink: bool,
 }
 
-/// Directory walks and directory canonicalizations shared within one build.
 #[derive(Default)]
 struct WalkMemo {
     walks: HashMap<(PathBuf, bool), Arc<Vec<WalkedFile>>>,
@@ -3121,7 +3120,6 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
     })
 }
 
-/// 64-bit multiply-fold hash over eight-byte words, for change detection.
 fn simple_hash(s: &str) -> u64 {
     const K0: u64 = 0xa076_1d64_78bd_642f;
     const K1: u64 = 0xe703_7ed1_a0b4_28db;
