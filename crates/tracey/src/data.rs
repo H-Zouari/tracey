@@ -668,14 +668,6 @@ struct ScanRootPattern {
     exact_file: bool,
 }
 
-impl ScanRootPattern {
-    fn walk(&self) -> ignore::Walk {
-        project_walker(&self.root)
-            .max_depth(self.exact_file.then_some(1))
-            .build()
-    }
-}
-
 struct WalkedFile {
     path: PathBuf,
     is_symlink: bool,
@@ -688,24 +680,70 @@ struct WalkMemo {
 }
 
 impl WalkMemo {
+    fn prefetch(&mut self, keys: &[(PathBuf, bool)]) {
+        let mut pending: Vec<&(PathBuf, bool)> = Vec::new();
+        for key in keys {
+            if !self.walks.contains_key(key) && !pending.contains(&key) {
+                pending.push(key);
+            }
+        }
+        for exact_file in [false, true] {
+            let mut remaining: Vec<PathBuf> = pending
+                .iter()
+                .filter(|(_, exact)| *exact == exact_file)
+                .map(|(root, _)| root.clone())
+                .collect();
+            while !remaining.is_empty() {
+                let mut group: Vec<PathBuf> = Vec::new();
+                let mut rest: Vec<PathBuf> = Vec::new();
+                for root in remaining {
+                    if group
+                        .iter()
+                        .any(|kept| root.starts_with(kept) || kept.starts_with(&root))
+                    {
+                        rest.push(root);
+                    } else {
+                        group.push(root);
+                    }
+                }
+                self.walk_group(group, exact_file);
+                remaining = rest;
+            }
+        }
+    }
+
+    fn walk_group(&mut self, roots: Vec<PathBuf>, exact_file: bool) {
+        let mut builder = project_walker(&roots[0]);
+        for root in &roots[1..] {
+            builder.add(root);
+        }
+        let mut found: Vec<Vec<WalkedFile>> = roots.iter().map(|_| Vec::new()).collect();
+        for entry in builder
+            .max_depth(exact_file.then_some(1))
+            .build()
+            .flatten()
+            .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+        {
+            if let Some(index) = roots.iter().position(|root| entry.path().starts_with(root)) {
+                found[index].push(WalkedFile {
+                    is_symlink: entry.path_is_symlink(),
+                    path: entry.into_path(),
+                });
+            }
+        }
+        for (root, files) in roots.into_iter().zip(found) {
+            self.walks.insert((root, exact_file), Arc::new(files));
+        }
+    }
+
     fn files(&mut self, pattern: &ScanRootPattern) -> Arc<Vec<WalkedFile>> {
-        Arc::clone(
-            self.walks
-                .entry((pattern.root.clone(), pattern.exact_file))
-                .or_insert_with(|| {
-                    Arc::new(
-                        pattern
-                            .walk()
-                            .flatten()
-                            .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
-                            .map(|entry| WalkedFile {
-                                is_symlink: entry.path_is_symlink(),
-                                path: entry.into_path(),
-                            })
-                            .collect(),
-                    )
-                }),
-        )
+        if !self
+            .walks
+            .contains_key(&(pattern.root.clone(), pattern.exact_file))
+        {
+            self.prefetch(&[(pattern.root.clone(), pattern.exact_file)]);
+        }
+        Arc::clone(&self.walks[&(pattern.root.clone(), pattern.exact_file)])
     }
 
     fn canonical(&mut self, file: &WalkedFile) -> PathBuf {
@@ -759,25 +797,29 @@ fn split_glob_prefix(pattern: &str) -> (&str, &str) {
     }
 }
 
-fn build_scan_roots(
+struct ScanRootSpec {
+    pattern: String,
+    root: PathBuf,
+    base: PathBuf,
+    glob: String,
+    exact_file: bool,
+}
+
+fn resolve_scan_roots(
     project_root: &Path,
     include: &[String],
-) -> (Vec<ScanRootPattern>, Vec<String>) {
-    let mut roots = Vec::new();
-    let mut warnings = Vec::new();
-
+) -> Vec<std::result::Result<ScanRootSpec, String>> {
     if include.is_empty() {
-        roots.push(ScanRootPattern {
+        return vec![Ok(ScanRootSpec {
+            pattern: String::new(),
             root: project_root.to_path_buf(),
             base: PathBuf::new(),
-            matcher: globset::Glob::new("**/*")
-                .expect("valid glob")
-                .compile_matcher(),
+            glob: "**/*".to_string(),
             exact_file: false,
-        });
-        return (roots, warnings);
+        })];
     }
 
+    let mut specs = Vec::new();
     for pattern in include {
         let (base_path, glob_suffix) = split_glob_prefix(pattern);
 
@@ -789,11 +831,11 @@ fn build_scan_roots(
         };
 
         if !base_path.is_empty() && !resolved_root.exists() {
-            warnings.push(format!(
+            specs.push(Err(format!(
                 "Warning: Path not found: {}\n  Pattern: {}",
                 resolved_root.display(),
                 pattern
-            ));
+            )));
             continue;
         }
 
@@ -804,10 +846,10 @@ fn build_scan_roots(
             let file_name = match resolved_root.file_name() {
                 Some(name) => name.to_string_lossy().to_string(),
                 None => {
-                    warnings.push(format!(
+                    specs.push(Err(format!(
                         "Warning: Could not determine file name for include path '{}'",
                         pattern
-                    ));
+                    )));
                     continue;
                 }
             };
@@ -815,10 +857,10 @@ fn build_scan_roots(
             resolved_root = match resolved_root.parent() {
                 Some(parent) => parent.to_path_buf(),
                 None => {
-                    warnings.push(format!(
+                    specs.push(Err(format!(
                         "Warning: Could not determine parent directory for include path '{}'",
                         pattern
-                    ));
+                    )));
                     continue;
                 }
             };
@@ -829,22 +871,47 @@ fn build_scan_roots(
             glob_suffix.to_string()
         };
 
-        let matcher = match globset::Glob::new(&effective_glob) {
+        specs.push(Ok(ScanRootSpec {
+            pattern: pattern.clone(),
+            root: resolved_root,
+            base,
+            glob: effective_glob,
+            exact_file,
+        }));
+    }
+    specs
+}
+
+fn build_scan_roots(
+    project_root: &Path,
+    include: &[String],
+) -> (Vec<ScanRootPattern>, Vec<String>) {
+    let mut roots = Vec::new();
+    let mut warnings = Vec::new();
+
+    for spec in resolve_scan_roots(project_root, include) {
+        let spec = match spec {
+            Ok(spec) => spec,
+            Err(warning) => {
+                warnings.push(warning);
+                continue;
+            }
+        };
+        let matcher = match globset::Glob::new(&spec.glob) {
             Ok(glob) => glob.compile_matcher(),
             Err(e) => {
                 warnings.push(format!(
                     "Warning: Invalid glob pattern '{}': {}",
-                    pattern, e
+                    spec.pattern, e
                 ));
                 continue;
             }
         };
-
         roots.push(ScanRootPattern {
-            root: resolved_root,
-            base,
+            root: spec.root,
+            base: spec.base,
             matcher,
-            exact_file,
+            exact_file: spec.exact_file,
         });
     }
 
@@ -2711,6 +2778,30 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
         total_impls,
         overlay.len()
     );
+
+    let mut prefetch_roots: Vec<(PathBuf, bool)> = Vec::new();
+    let mut add_roots = |include: &[String]| {
+        prefetch_roots.extend(
+            resolve_scan_roots(project_root, include)
+                .into_iter()
+                .flatten()
+                .map(|spec| (spec.root, spec.exact_file)),
+        );
+    };
+    for spec_config in &config.specs {
+        if changed_files.is_empty() {
+            add_roots(&spec_config.include);
+        }
+        for impl_config in &spec_config.impls {
+            if changed_files.is_empty() {
+                add_roots(&impl_config.include);
+            }
+            if !impl_config.test_include.is_empty() {
+                add_roots(&impl_config.test_include);
+            }
+        }
+    }
+    walk_memo.prefetch(&prefetch_roots);
 
     // r[impl config.impl.test_include]
     // Collect all test file patterns and find matching files
