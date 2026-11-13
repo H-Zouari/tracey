@@ -315,6 +315,16 @@ pub async fn parse_spec(fmt: SpecFormat, content: &str) -> eyre::Result<SpecDoc>
     fmt.backend().parse(content).await
 }
 
+pub async fn parse_spec_with_flow_steps(
+    fmt: SpecFormat,
+    content: &str,
+) -> eyre::Result<(SpecDoc, Vec<(String, Vec<String>)>)> {
+    match fmt {
+        SpecFormat::Sdoc => sdoc::parse_with_flow_steps(content).await,
+        _ => Ok((parse_spec(fmt, content).await?, Vec::new())),
+    }
+}
+
 /// Render spec sources to dashboard HTML via the backend for `fmt`.
 ///
 /// Thin shim over [`SpecBackend::render_html`] that hides the

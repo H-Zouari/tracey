@@ -151,7 +151,7 @@ impl Engine {
             // Deprecated config found - use empty config and record error
             (Config::default(), Some(err))
         } else {
-            match tokio::fs::read_to_string(&config_path).await {
+            match std::fs::read_to_string(&config_path) {
                 Ok(content) => match facet_styx::from_str(&content) {
                     Ok(config) => (config, None),
                     Err(e) => {
@@ -478,7 +478,7 @@ impl Engine {
         let start = Instant::now();
 
         // Reload config - record errors but continue with current config
-        let (config, new_config_error) = match tokio::fs::read_to_string(&self.config_path).await {
+        let (config, new_config_error) = match std::fs::read_to_string(&self.config_path) {
             Ok(content) => match facet_styx::from_str(&content) {
                 Ok(config) => (Some(config), None),
                 Err(e) => {

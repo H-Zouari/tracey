@@ -1,14 +1,19 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tracey_core::code_units::{CodeUnit, CodeUnitKind};
-use tracey_core::{ParseWarning, RefVerb, ReqReference, RuleId, SourceSpan, WarningKind};
+use tracey_core::{
+    ParseWarning, RefVerb, ReqDefinition, ReqReference, RuleId, SourceSpan, SpecFormat, WarningKind,
+};
 
-use super::CachedSourceFile;
+use super::{CachedSourceFile, CachedSpecFile, LspRange, SpecDiagnosticSource, SpecParse};
 
 const DIR: &str = ".tracey_cache";
 const FILE: &str = "sources.bin";
+const SPEC_FILE: &str = "specs.bin";
 const MAGIC: &[u8; 8] = b"TRACEY\0\x01";
+const SPEC_MAGIC: &[u8; 8] = b"TRACEYS\x01";
 const CACHEDIR_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n\
 # This file is a cache directory tag created by tracey.\n\
 # For information about cache directory tags see https://bford.info/cachedir/\n";
@@ -43,6 +48,11 @@ fn identity() -> String {
     )
 }
 
+pub(super) struct ParsedSpec {
+    pub content_hash: u64,
+    pub parse: SpecParse,
+}
+
 pub(super) fn load(root: &Path) -> HashMap<PathBuf, ParsedSource> {
     std::fs::read(root.join(DIR).join(FILE))
         .ok()
@@ -50,7 +60,10 @@ pub(super) fn load(root: &Path) -> HashMap<PathBuf, ParsedSource> {
         .unwrap_or_default()
 }
 
-pub(super) fn save(root: &Path, files: &HashMap<PathBuf, CachedSourceFile>) -> std::io::Result<()> {
+pub(super) fn save(
+    root: &Path,
+    files: &HashMap<PathBuf, Arc<CachedSourceFile>>,
+) -> std::io::Result<()> {
     let dir = root.join(DIR);
     std::fs::create_dir_all(&dir)?;
     write_if_missing(&dir.join(".gitignore"), b"*\n")?;
@@ -60,6 +73,26 @@ pub(super) fn save(root: &Path, files: &HashMap<PathBuf, CachedSourceFile>) -> s
     std::fs::rename(&temporary, dir.join(FILE))
 }
 
+pub(super) fn load_specs(root: &Path) -> HashMap<PathBuf, ParsedSpec> {
+    std::fs::read(root.join(DIR).join(SPEC_FILE))
+        .ok()
+        .and_then(|bytes| decode_specs(&bytes, &identity()))
+        .unwrap_or_default()
+}
+
+pub(super) fn save_specs(
+    root: &Path,
+    files: &HashMap<PathBuf, CachedSpecFile>,
+) -> std::io::Result<()> {
+    let dir = root.join(DIR);
+    std::fs::create_dir_all(&dir)?;
+    write_if_missing(&dir.join(".gitignore"), b"*\n")?;
+    write_if_missing(&dir.join("CACHEDIR.TAG"), CACHEDIR_TAG)?;
+    let temporary = dir.join(format!("{SPEC_FILE}.{}", std::process::id()));
+    std::fs::write(&temporary, encode_specs(files, &identity()))?;
+    std::fs::rename(&temporary, dir.join(SPEC_FILE))
+}
+
 fn write_if_missing(path: &Path, content: &[u8]) -> std::io::Result<()> {
     if path.exists() {
         return Ok(());
@@ -67,13 +100,13 @@ fn write_if_missing(path: &Path, content: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
-fn encode(files: &HashMap<PathBuf, CachedSourceFile>, identity: &str) -> Vec<u8> {
+fn encode(files: &HashMap<PathBuf, Arc<CachedSourceFile>>, identity: &str) -> Vec<u8> {
     let mut out = Writer(Vec::with_capacity(64 * 1024));
     out.0.extend_from_slice(MAGIC);
     out.str(identity);
     let named: Vec<(&str, &CachedSourceFile)> = files
         .iter()
-        .filter_map(|(path, file)| Some((path.to_str()?, file)))
+        .filter_map(|(path, file)| Some((path.to_str()?, &**file)))
         .collect();
     out.usize(named.len());
     for (path, file) in named {
@@ -203,6 +236,166 @@ fn decode(bytes: &[u8], identity: &str) -> Option<HashMap<PathBuf, ParsedSource>
     input.0.is_empty().then_some(files)
 }
 
+fn encode_specs(files: &HashMap<PathBuf, CachedSpecFile>, identity: &str) -> Vec<u8> {
+    let mut out = Writer(Vec::with_capacity(64 * 1024));
+    out.0.extend_from_slice(SPEC_MAGIC);
+    out.str(identity);
+    let named: Vec<(&str, &CachedSpecFile)> = files
+        .iter()
+        .filter_map(|(path, file)| Some((path.to_str()?, file)))
+        .collect();
+    out.usize(named.len());
+    for (path, file) in named {
+        out.str(path);
+        out.u64(file.content_hash);
+        out.usize(file.parsed.rules.len());
+        for rule in &file.parsed.rules {
+            let def = &rule.def;
+            out.str(&def.id.base);
+            out.u64(u64::from(def.id.version));
+            out.str(&def.anchor_id);
+            out.marq_span(def.marker_span);
+            out.marq_span(def.span);
+            out.usize(def.line);
+            out.option_str(def.metadata.status.map(|status| status.as_str()));
+            out.option_str(def.metadata.level.map(|level| level.as_str()));
+            out.option_str(def.metadata.since.as_deref());
+            out.option_str(def.metadata.until.as_deref());
+            out.usize(def.metadata.tags.len());
+            for tag in &def.metadata.tags {
+                out.str(tag);
+            }
+            out.str(&def.raw);
+            out.str(&def.html);
+            out.str(&rule.source_file);
+            out.str(rule.format.name());
+            out.str(&rule.prefix);
+            out.option_usize(rule.column);
+            out.option_str(rule.section.as_deref());
+            out.option_str(rule.section_title.as_deref());
+            out.usize(rule.steps.len());
+            for step in &rule.steps {
+                out.str(step);
+            }
+        }
+        let diagnostics = &file.parsed.diagnostics;
+        out.usize(diagnostics.definitions.len());
+        for (rule_id, range) in &diagnostics.definitions {
+            out.rule(rule_id);
+            out.range(*range);
+        }
+        out.usize(diagnostics.references.len());
+        for (prefix, rule_id, range) in &diagnostics.references {
+            out.str(prefix);
+            out.rule(rule_id);
+            out.range(*range);
+        }
+    }
+    out.0
+}
+
+fn decode_specs(bytes: &[u8], identity: &str) -> Option<HashMap<PathBuf, ParsedSpec>> {
+    let mut input = Reader(bytes);
+    if input.take(SPEC_MAGIC.len())? != SPEC_MAGIC || input.str()? != identity {
+        return None;
+    }
+    let count = input.count()?;
+    let mut files = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let path = PathBuf::from(input.str()?);
+        let content_hash = input.u64()?;
+        let n = input.count()?;
+        let mut rules = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = marq::RuleId {
+                base: input.str()?.to_string(),
+                version: u32::try_from(input.u64()?).ok()?,
+            };
+            let anchor_id = input.str()?.to_string();
+            let marker_span = input.marq_span()?;
+            let span = input.marq_span()?;
+            let line = input.usize()?;
+            let status = match input.option_str()? {
+                Some(text) => Some(marq::ReqStatus::parse(text)?),
+                None => None,
+            };
+            let level = match input.option_str()? {
+                Some(text) => Some(marq::ReqLevel::parse(text)?),
+                None => None,
+            };
+            let since = input.option_str()?.map(str::to_string);
+            let until = input.option_str()?.map(str::to_string);
+            let tag_count = input.count()?;
+            let mut tags = Vec::with_capacity(tag_count);
+            for _ in 0..tag_count {
+                tags.push(input.str()?.to_string());
+            }
+            let raw = input.str()?.to_string();
+            let html = input.str()?.to_string();
+            let source_file = input.str()?.to_string();
+            let format = SpecFormat::from_name(input.str()?)?;
+            let prefix = input.str()?.to_string();
+            let column = input.option_usize()?;
+            let section = input.option_str()?.map(str::to_string);
+            let section_title = input.option_str()?.map(str::to_string);
+            let step_count = input.count()?;
+            let mut steps = Vec::with_capacity(step_count);
+            for _ in 0..step_count {
+                steps.push(input.str()?.to_string());
+            }
+            rules.push(std::sync::Arc::new(crate::ExtractedRule {
+                def: ReqDefinition {
+                    id,
+                    anchor_id,
+                    marker_span,
+                    span,
+                    line,
+                    metadata: marq::ReqMetadata {
+                        status,
+                        level,
+                        since,
+                        until,
+                        tags,
+                    },
+                    raw,
+                    html,
+                },
+                source_file,
+                format,
+                prefix,
+                column,
+                section,
+                section_title,
+                steps,
+            }));
+        }
+        let n = input.count()?;
+        let mut definitions = Vec::with_capacity(n);
+        for _ in 0..n {
+            definitions.push((input.rule()?, input.range()?));
+        }
+        let n = input.count()?;
+        let mut references = Vec::with_capacity(n);
+        for _ in 0..n {
+            references.push((input.str()?.to_string(), input.rule()?, input.range()?));
+        }
+        files.insert(
+            path,
+            ParsedSpec {
+                content_hash,
+                parse: SpecParse {
+                    rules,
+                    diagnostics: std::sync::Arc::new(SpecDiagnosticSource {
+                        definitions,
+                        references,
+                    }),
+                },
+            },
+        );
+    }
+    input.0.is_empty().then_some(files)
+}
+
 fn verb_code(verb: RefVerb) -> u8 {
     match verb {
         RefVerb::Define => 0,
@@ -284,6 +477,37 @@ impl Writer {
         self.usize(span.offset);
         self.usize(span.length);
     }
+
+    fn marq_span(&mut self, span: marq::SourceSpan) {
+        self.usize(span.offset);
+        self.usize(span.length);
+    }
+
+    fn option_str(&mut self, value: Option<&str>) {
+        match value {
+            Some(text) => {
+                self.u8(1);
+                self.str(text);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn option_usize(&mut self, value: Option<usize>) {
+        match value {
+            Some(number) => {
+                self.u8(1);
+                self.usize(number);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn range(&mut self, (a, b, c, d): LspRange) {
+        for value in [a, b, c, d] {
+            self.u64(u64::from(value));
+        }
+    }
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -325,5 +549,33 @@ impl<'a> Reader<'a> {
 
     fn span(&mut self) -> Option<SourceSpan> {
         Some(SourceSpan::new(self.usize()?, self.usize()?))
+    }
+
+    fn marq_span(&mut self) -> Option<marq::SourceSpan> {
+        Some(marq::SourceSpan {
+            offset: self.usize()?,
+            length: self.usize()?,
+        })
+    }
+
+    fn option_str(&mut self) -> Option<Option<&'a str>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some(self.str()?)),
+            _ => None,
+        }
+    }
+
+    fn option_usize(&mut self) -> Option<Option<usize>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some(self.usize()?)),
+            _ => None,
+        }
+    }
+
+    fn range(&mut self) -> Option<LspRange> {
+        let mut next = || u32::try_from(self.u64()?).ok();
+        Some((next()?, next()?, next()?, next()?))
     }
 }

@@ -21,7 +21,8 @@ use tracey_core::{
 };
 use tracey_core::{SUPPORTED_EXTENSIONS, is_supported_extension};
 use tracey_core::{
-    SlugAllocator, SpecFormat, is_spec_extension, parse_spec, parse_weight, req_anchor_id,
+    SlugAllocator, SpecFormat, is_spec_extension, parse_spec_with_flow_steps, parse_weight,
+    req_anchor_id,
 };
 use tracing::info;
 
@@ -68,20 +69,16 @@ pub struct DashboardData {
     /// [`tracey_core::SpecConfigs`] on demand via [`build_spec_configs`].
     pub format_config_by_spec: BTreeMap<String, FormatConfig>,
     /// Source files for full-text index construction
-    pub search_files: BTreeMap<PathBuf, String>,
+    pub search_files: BTreeMap<PathBuf, Arc<str>>,
     /// Parsed requirement references and warnings by source file, captured during rebuild.
     /// Includes all prefixes found in scanned files (not filtered to a spec prefix).
     pub source_reqs_by_file: BTreeMap<PathBuf, Reqs>,
     /// Rules for full-text index construction
     pub search_rules: Vec<search::RuleEntry>,
-    /// Precomputed validation diagnostics by (spec, impl).
-    pub validation_by_impl: BTreeMap<ImplKey, ValidationResult>,
-    /// Precomputed workspace diagnostics for LSP publishing.
-    pub workspace_diagnostics: Vec<LspFileDiagnostics>,
+    diagnostic_inputs: DiagnosticInputs,
+    diagnostics: std::sync::OnceLock<Diagnostics>,
     /// Version number (incremented only when content actually changes)
     pub version: u64,
-    /// Hash of forward + reverse JSON for change detection
-    pub content_hash: u64,
     /// Delta from previous build (what changed)
     pub delta: crate::server::Delta,
     /// Files matched by test_include patterns (only verify allowed)
@@ -91,9 +88,77 @@ pub struct DashboardData {
 
 mod disk_cache;
 
+struct DiagnosticInputs {
+    abs_root: PathBuf,
+    config_path: PathBuf,
+    spec_diagnostics: BTreeMap<PathBuf, Arc<SpecDiagnosticSource>>,
+    source_files_by_impl: BTreeMap<ImplKey, BTreeSet<PathBuf>>,
+    include_parse_failures: BTreeMap<PathBuf, String>,
+    include_parse_failures_by_impl: BTreeMap<ImplKey, BTreeMap<PathBuf, String>>,
+}
+
+struct Diagnostics {
+    validation_by_impl: BTreeMap<ImplKey, ValidationResult>,
+    workspace_diagnostics: Vec<LspFileDiagnostics>,
+}
+
+impl DashboardData {
+    fn diagnostics(&self) -> &Diagnostics {
+        self.diagnostics.get_or_init(|| {
+            let inputs = &self.diagnostic_inputs;
+            let source_ctx = build_source_diagnostic_context(&self.config, &self.forward_by_impl);
+            let source_issues: BTreeMap<PathBuf, Vec<SourceDiagnosticIssue>> = self
+                .source_reqs_by_file
+                .iter()
+                .filter_map(|(path, reqs)| {
+                    let content = self.search_files.get(path)?;
+                    let issues = collect_source_diagnostic_issues(
+                        content,
+                        reqs,
+                        self.test_files.contains(path),
+                        &source_ctx,
+                    );
+                    Some((path.clone(), issues))
+                })
+                .collect();
+            Diagnostics {
+                validation_by_impl: compute_validation_by_impl(
+                    &inputs.abs_root,
+                    &inputs.config_path,
+                    &self.forward_by_impl,
+                    &inputs.source_files_by_impl,
+                    &self.source_reqs_by_file,
+                    &source_issues,
+                    &inputs.include_parse_failures_by_impl,
+                ),
+                workspace_diagnostics: compute_workspace_diagnostics(
+                    &inputs.abs_root,
+                    &inputs.config_path,
+                    &self.config,
+                    &self.forward_by_impl,
+                    &self.source_reqs_by_file,
+                    &inputs.spec_diagnostics,
+                    &source_issues,
+                    &inputs.include_parse_failures,
+                ),
+            }
+        })
+    }
+
+    /// Validation diagnostics by (spec, impl), computed on first use.
+    pub fn validation_by_impl(&self) -> &BTreeMap<ImplKey, ValidationResult> {
+        &self.diagnostics().validation_by_impl
+    }
+
+    /// Workspace diagnostics for LSP publishing, computed on first use.
+    pub fn workspace_diagnostics(&self) -> &[LspFileDiagnostics] {
+        &self.diagnostics().workspace_diagnostics
+    }
+}
+
 #[derive(Default)]
 pub struct BuildCache {
-    source_files: HashMap<PathBuf, CachedSourceFile>,
+    source_files: HashMap<PathBuf, Arc<CachedSourceFile>>,
     impl_scan_paths: HashMap<ImplScanKey, CachedScanPaths>,
     spec_scan_paths: HashMap<SpecScanKey, CachedScanPaths>,
     spec_files: HashMap<PathBuf, CachedSpecFile>,
@@ -103,17 +168,22 @@ pub struct BuildCache {
 struct OnDisk {
     root: PathBuf,
     unclaimed: HashMap<PathBuf, disk_cache::ParsedSource>,
+    unclaimed_specs: HashMap<PathBuf, disk_cache::ParsedSpec>,
     stale: bool,
+    specs_stale: bool,
 }
 
 impl BuildCache {
     pub fn on_disk(project_root: &Path) -> Self {
         let unclaimed = disk_cache::load(project_root);
+        let unclaimed_specs = disk_cache::load_specs(project_root);
         Self {
             on_disk: Some(OnDisk {
                 root: project_root.to_path_buf(),
                 stale: unclaimed.is_empty(),
+                specs_stale: unclaimed_specs.is_empty(),
                 unclaimed,
+                unclaimed_specs,
             }),
             ..Self::default()
         }
@@ -123,14 +193,20 @@ impl BuildCache {
         let Some(on_disk) = &mut self.on_disk else {
             return;
         };
-        if !on_disk.stale && on_disk.unclaimed.is_empty() {
-            return;
+        if on_disk.stale || !on_disk.unclaimed.is_empty() {
+            if let Err(error) = disk_cache::save(&on_disk.root, &self.source_files) {
+                tracing::debug!("could not write the parse cache: {error}");
+            }
+            on_disk.unclaimed.clear();
+            on_disk.stale = false;
         }
-        if let Err(error) = disk_cache::save(&on_disk.root, &self.source_files) {
-            tracing::debug!("could not write the parse cache: {error}");
+        if on_disk.specs_stale || !on_disk.unclaimed_specs.is_empty() {
+            if let Err(error) = disk_cache::save_specs(&on_disk.root, &self.spec_files) {
+                tracing::debug!("could not write the spec parse cache: {error}");
+            }
+            on_disk.unclaimed_specs.clear();
+            on_disk.specs_stale = false;
         }
-        on_disk.unclaimed.clear();
-        on_disk.stale = false;
     }
 }
 
@@ -139,7 +215,7 @@ struct CachedSourceFile {
     content_hash: u64,
     file_len: u64,
     modified_nanos: Option<u128>,
-    content: String,
+    content: Arc<str>,
     refs: Vec<ReqReference>,
     parse_warnings: Vec<ParseWarning>,
     code_units: Vec<CodeUnit>,
@@ -171,12 +247,25 @@ struct CachedScanPaths {
     files: BTreeSet<PathBuf>,
 }
 
+type LspRange = (u32, u32, u32, u32);
+
+struct SpecDiagnosticSource {
+    definitions: Vec<(RuleId, LspRange)>,
+    references: Vec<(String, RuleId, LspRange)>,
+}
+
+#[derive(Clone)]
+struct SpecParse {
+    rules: Vec<Arc<crate::ExtractedRule>>,
+    diagnostics: Arc<SpecDiagnosticSource>,
+}
+
 #[derive(Clone)]
 struct CachedSpecFile {
     content_hash: u64,
     file_len: u64,
     modified_nanos: Option<u128>,
-    extracted_rules: Vec<crate::ExtractedRule>,
+    parsed: SpecParse,
 }
 
 /// Escape HTML special characters
@@ -435,7 +524,7 @@ async fn read_file_with_overlay(path: &Path, overlay: &FileOverlay) -> std::io::
         return Ok(content.clone());
     }
     // Fall back to disk (async)
-    tokio::fs::read_to_string(path).await
+    std::fs::read_to_string(path)
 }
 
 fn file_modified_nanos(modified: SystemTime) -> Option<u128> {
@@ -450,7 +539,7 @@ fn compute_content_hash(content: &str) -> u64 {
 }
 
 enum SourceLookup {
-    Cached(CachedSourceFile),
+    Cached(Arc<CachedSourceFile>),
     Unparsed(UnparsedSourceFile),
 }
 
@@ -463,7 +552,7 @@ struct UnparsedSourceFile {
 }
 
 impl UnparsedSourceFile {
-    fn parse(self) -> (PathBuf, CachedSourceFile) {
+    fn parse(self) -> (PathBuf, Arc<CachedSourceFile>) {
         let (units, extracted) =
             tracey_core::code_units::extract_file(&self.canonical, &self.content);
         let reqs = Reqs::from_extracted(&self.canonical, extracted);
@@ -471,23 +560,22 @@ impl UnparsedSourceFile {
             content_hash: self.content_hash,
             file_len: self.file_len,
             modified_nanos: self.modified_nanos,
-            content: self.content,
+            content: Arc::from(self.content),
             refs: reqs.references,
             parse_warnings: reqs.warnings,
             code_units: units.units,
         };
-        (self.canonical, parsed)
+        (self.canonical, Arc::new(parsed))
     }
 }
 
 async fn lookup_source_file(
     path: &Path,
+    canonical: PathBuf,
     overlay: &FileOverlay,
     cache: &mut BuildCache,
     stats: &mut CacheStats,
 ) -> std::io::Result<SourceLookup> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-
     let overlay_content = overlay
         .get(path)
         .or_else(|| overlay.get(&canonical))
@@ -499,7 +587,7 @@ async fn lookup_source_file(
             && entry.content_hash == content_hash
         {
             stats.hash_hits += 1;
-            return Ok(SourceLookup::Cached(entry.clone()));
+            return Ok(SourceLookup::Cached(Arc::clone(entry)));
         }
         stats.misses += 1;
         stats.reparsed += 1;
@@ -513,7 +601,7 @@ async fn lookup_source_file(
         }));
     }
 
-    let metadata = tokio::fs::metadata(&canonical).await?;
+    let metadata = std::fs::metadata(&canonical)?;
     let file_len = metadata.len();
     let modified_nanos = metadata.modified().ok().and_then(file_modified_nanos);
 
@@ -522,7 +610,7 @@ async fn lookup_source_file(
         && entry.modified_nanos == modified_nanos
     {
         stats.metadata_hits += 1;
-        return Ok(SourceLookup::Cached(entry.clone()));
+        return Ok(SourceLookup::Cached(Arc::clone(entry)));
     }
 
     let content = read_file_with_overlay(&canonical, overlay).await?;
@@ -531,10 +619,11 @@ async fn lookup_source_file(
     if let Some(entry) = cache.source_files.get(&canonical)
         && entry.content_hash == content_hash
     {
-        let mut updated = entry.clone();
+        let mut updated = CachedSourceFile::clone(entry);
         updated.file_len = file_len;
         updated.modified_nanos = modified_nanos;
-        cache.source_files.insert(canonical, updated.clone());
+        let updated = Arc::new(updated);
+        cache.source_files.insert(canonical, Arc::clone(&updated));
         stats.hash_hits += 1;
         return Ok(SourceLookup::Cached(updated));
     }
@@ -543,16 +632,16 @@ async fn lookup_source_file(
         && let Some(parsed) = on_disk.unclaimed.remove(&canonical)
         && parsed.content_hash == content_hash
     {
-        let file = CachedSourceFile {
+        let file = Arc::new(CachedSourceFile {
             content_hash,
             file_len,
             modified_nanos,
-            content,
+            content: Arc::from(content),
             refs: parsed.refs,
             parse_warnings: parsed.parse_warnings,
             code_units: parsed.code_units,
-        };
-        cache.source_files.insert(canonical, file.clone());
+        });
+        cache.source_files.insert(canonical, Arc::clone(&file));
         stats.hash_hits += 1;
         return Ok(SourceLookup::Cached(file));
     }
@@ -584,6 +673,59 @@ impl ScanRootPattern {
         project_walker(&self.root)
             .max_depth(self.exact_file.then_some(1))
             .build()
+    }
+}
+
+struct WalkedFile {
+    path: PathBuf,
+    is_symlink: bool,
+}
+
+/// Directory walks and directory canonicalizations shared within one build.
+#[derive(Default)]
+struct WalkMemo {
+    walks: HashMap<(PathBuf, bool), Arc<Vec<WalkedFile>>>,
+    directories: HashMap<PathBuf, PathBuf>,
+}
+
+impl WalkMemo {
+    fn files(&mut self, pattern: &ScanRootPattern) -> Arc<Vec<WalkedFile>> {
+        Arc::clone(
+            self.walks
+                .entry((pattern.root.clone(), pattern.exact_file))
+                .or_insert_with(|| {
+                    Arc::new(
+                        pattern
+                            .walk()
+                            .flatten()
+                            .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+                            .map(|entry| WalkedFile {
+                                is_symlink: entry.path_is_symlink(),
+                                path: entry.into_path(),
+                            })
+                            .collect(),
+                    )
+                }),
+        )
+    }
+
+    fn canonical(&mut self, file: &WalkedFile) -> PathBuf {
+        if !file.is_symlink
+            && let (Some(parent), Some(name)) = (file.path.parent(), file.path.file_name())
+        {
+            let directory = self
+                .directories
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| {
+                    parent
+                        .canonicalize()
+                        .unwrap_or_else(|_| parent.to_path_buf())
+                });
+            return directory.join(name);
+        }
+        file.path
+            .canonicalize()
+            .unwrap_or_else(|_| file.path.clone())
     }
 }
 
@@ -742,15 +884,11 @@ enum ExcludeMatch {
 fn exclude_match(
     path: &Path,
     roots: &[ScanRootPattern],
-    exclude: &[String],
+    matchers: &[(&String, globset::GlobMatcher)],
 ) -> Option<ExcludeMatch> {
-    if exclude.is_empty() {
+    if matchers.is_empty() {
         return None;
     }
-    let matchers: Vec<(&String, globset::GlobMatcher)> = exclude
-        .iter()
-        .filter_map(|p| Some((p, globset::Glob::new(p).ok()?.compile_matcher())))
-        .collect();
     let candidates: Vec<(&ScanRootPattern, &Path)> = roots
         .iter()
         .filter_map(|r| Some((r, path.strip_prefix(&r.root).ok()?)))
@@ -773,9 +911,16 @@ fn exclude_match(
     None
 }
 
+fn compile_excludes(exclude: &[String]) -> Vec<(&String, globset::GlobMatcher)> {
+    exclude
+        .iter()
+        .filter_map(|p| Some((p, globset::Glob::new(p).ok()?.compile_matcher())))
+        .collect()
+}
+
 /// True if `path` matches one of the `exclude` patterns, in either form.
 fn path_matches_excludes(path: &Path, roots: &[ScanRootPattern], exclude: &[String]) -> bool {
-    exclude_match(path, roots, exclude).is_some()
+    exclude_match(path, roots, &compile_excludes(exclude)).is_some()
 }
 
 /// Deprecation warning for an `exclude` pattern that only matched relative
@@ -796,18 +941,15 @@ fn full_walk_for_roots(
     include_supported_ext_only: bool,
     include_spec_only: bool,
     exclude: &[String],
+    memo: &mut WalkMemo,
 ) -> (BTreeSet<PathBuf>, Vec<String>) {
     let mut out = BTreeSet::new();
     let mut legacy_excludes: BTreeSet<(String, PathBuf)> = BTreeSet::new();
+    let matchers = compile_excludes(exclude);
     for root_pattern in roots {
-        for entry in root_pattern.walk().flatten() {
-            let path = entry.path();
-            let Some(ft) = entry.file_type() else {
-                continue;
-            };
-            if !ft.is_file() {
-                continue;
-            }
+        let walked = memo.files(root_pattern);
+        for file in walked.iter() {
+            let path = file.path.as_path();
             if include_spec_only && path.extension().is_none_or(|ext| !is_spec_extension(ext)) {
                 continue;
             }
@@ -821,7 +963,7 @@ fn full_walk_for_roots(
             if !path_matches_root_pattern(path, root_pattern) {
                 continue;
             }
-            match exclude_match(path, roots, exclude) {
+            match exclude_match(path, roots, &matchers) {
                 Some(ExcludeMatch::ProjectRelative) => continue,
                 Some(ExcludeMatch::Legacy { pattern, base }) => {
                     legacy_excludes.insert((pattern, base));
@@ -829,8 +971,7 @@ fn full_walk_for_roots(
                 }
                 None => {}
             }
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            out.insert(canonical);
+            out.insert(memo.canonical(file));
         }
     }
     let warnings = legacy_excludes
@@ -878,6 +1019,7 @@ fn get_cached_impl_scan_paths(
     exclude: &[String],
     changed_files: &[PathBuf],
     cache: &mut BuildCache,
+    memo: &mut WalkMemo,
 ) -> (BTreeSet<PathBuf>, Vec<String>, bool) {
     let key = ImplScanKey {
         project_root: project_root.to_path_buf(),
@@ -891,7 +1033,7 @@ fn get_cached_impl_scan_paths(
         update_cached_scan_paths(entry, &roots, changed_files, false, false, exclude);
         did_full_walk = false;
     } else {
-        let (files, exclude_warnings) = full_walk_for_roots(&roots, false, false, exclude);
+        let (files, exclude_warnings) = full_walk_for_roots(&roots, false, false, exclude, memo);
         entry.files = files;
         warnings.extend(exclude_warnings);
         did_full_walk = true;
@@ -904,6 +1046,7 @@ fn get_cached_spec_scan_paths(
     include: &[String],
     changed_files: &[PathBuf],
     cache: &mut BuildCache,
+    memo: &mut WalkMemo,
 ) -> (BTreeSet<PathBuf>, Vec<String>, bool) {
     let key = SpecScanKey {
         project_root: project_root.to_path_buf(),
@@ -916,21 +1059,50 @@ fn get_cached_spec_scan_paths(
         update_cached_scan_paths(entry, &roots, changed_files, false, true, &[]);
         did_full_walk = false;
     } else {
-        entry.files = full_walk_for_roots(&roots, false, true, &[]).0;
+        entry.files = full_walk_for_roots(&roots, false, true, &[], memo).0;
         did_full_walk = true;
     }
     (entry.files.clone(), warnings, did_full_walk)
 }
 
+fn spec_diagnostic_source(doc: &tracey_core::SpecDoc, content: &str) -> SpecDiagnosticSource {
+    let lines = LineIndex::new(content);
+    SpecDiagnosticSource {
+        definitions: doc
+            .reqs
+            .iter()
+            .filter_map(|def| {
+                let rule_id = parse_rule_id(&def.id.to_string())?;
+                Some((
+                    rule_id,
+                    lines.range(def.marker_span.offset, def.marker_span.length),
+                ))
+            })
+            .collect(),
+        references: doc
+            .inline_code_spans
+            .iter()
+            .filter_map(|code_span| {
+                let (prefix, req_id) = parse_inline_rule_reference(&code_span.content)?;
+                Some((
+                    prefix,
+                    req_id,
+                    lines.range(code_span.span.offset, code_span.span.length),
+                ))
+            })
+            .collect(),
+    }
+}
+
 async fn extract_spec_rules_cached(
     project_root: &Path,
     path: &Path,
+    canonical: PathBuf,
     overlay: &FileOverlay,
     cache: &mut BuildCache,
     quiet: bool,
     stats: &mut CacheStats,
-) -> Result<Vec<crate::ExtractedRule>> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+) -> Result<SpecParse> {
     let overlay_content = overlay
         .get(path)
         .or_else(|| overlay.get(&canonical))
@@ -938,9 +1110,10 @@ async fn extract_spec_rules_cached(
     let overlay_is_present = overlay_content.is_some();
 
     let (content, file_len, modified_nanos) = if let Some(content) = overlay_content {
-        (content.clone(), content.len() as u64, None)
+        let len = content.len() as u64;
+        (content, len, None)
     } else {
-        let metadata = tokio::fs::metadata(&canonical).await.ok();
+        let metadata = std::fs::metadata(&canonical).ok();
         let file_len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
         let modified_nanos = metadata
             .as_ref()
@@ -960,18 +1133,18 @@ async fn extract_spec_rules_cached(
             && entry.modified_nanos == modified_nanos
         {
             stats.metadata_hits += 1;
-            return Ok(entry.extracted_rules.clone());
+            return Ok(entry.parsed.clone());
         }
         if entry.content_hash == content_hash {
             let updated = CachedSpecFile {
                 content_hash,
                 file_len,
                 modified_nanos,
-                extracted_rules: entry.extracted_rules.clone(),
+                parsed: entry.parsed.clone(),
             };
             cache.spec_files.insert(canonical, updated.clone());
             stats.hash_hits += 1;
-            return Ok(updated.extracted_rules);
+            return Ok(updated.parsed);
         }
     }
 
@@ -981,12 +1154,39 @@ async fn extract_spec_rules_cached(
         compute_relative_path(project_root, &canonical)
     };
 
+    if let Some(on_disk) = &mut cache.on_disk
+        && let Some(stored) = on_disk.unclaimed_specs.remove(&canonical)
+        && stored.content_hash == content_hash
+    {
+        if !quiet && !stored.parse.rules.is_empty() {
+            eprintln!(
+                "   {} {} requirements from {}",
+                "Found".green(),
+                stored.parse.rules.len(),
+                relative_display
+            );
+        }
+        cache.spec_files.insert(
+            canonical,
+            CachedSpecFile {
+                content_hash,
+                file_len,
+                modified_nanos,
+                parsed: stored.parse.clone(),
+            },
+        );
+        stats.hash_hits += 1;
+        return Ok(stored.parse);
+    }
+
     let fmt = SpecFormat::from_path(&canonical).unwrap_or(SpecFormat::Markdown);
-    let doc = parse_spec(fmt, &content)
+    let (doc, flow_steps) = parse_spec_with_flow_steps(fmt, &content)
         .await
         .map_err(|e| eyre::eyre!("Failed to process {}: {}", canonical.display(), e))?;
 
-    let extracted = crate::doc_to_extracted_rules(doc, &content, fmt, &relative_display)?;
+    let diagnostics = Arc::new(spec_diagnostic_source(&doc, &content));
+    let extracted =
+        crate::doc_to_extracted_rules(doc, flow_steps, &content, fmt, &relative_display)?;
 
     if !quiet && !extracted.is_empty() {
         eprintln!(
@@ -997,18 +1197,32 @@ async fn extract_spec_rules_cached(
         );
     }
 
+    let parsed = SpecParse {
+        rules: extracted.into_iter().map(Arc::new).collect(),
+        diagnostics,
+    };
     cache.spec_files.insert(
         canonical,
         CachedSpecFile {
             content_hash,
             file_len,
             modified_nanos,
-            extracted_rules: extracted.clone(),
+            parsed: parsed.clone(),
         },
     );
+    if let Some(on_disk) = &mut cache.on_disk {
+        on_disk.specs_stale = true;
+    }
     stats.misses += 1;
     stats.reparsed += 1;
-    Ok(extracted)
+    Ok(parsed)
+}
+
+struct LoadedSpecRules {
+    rules: Vec<Arc<crate::ExtractedRule>>,
+    paths: Vec<PathBuf>,
+    diagnostics: Vec<(PathBuf, Arc<SpecDiagnosticSource>)>,
+    did_full_walk: bool,
 }
 
 async fn load_rules_from_includes_cached(
@@ -1019,10 +1233,16 @@ async fn load_rules_from_includes_cached(
     quiet: bool,
     changed_files: &[PathBuf],
     stats: &mut CacheStats,
-) -> Result<(Vec<crate::ExtractedRule>, Vec<PathBuf>, bool)> {
+    memo: &mut WalkMemo,
+) -> Result<LoadedSpecRules> {
     let (mut spec_paths, _warnings, did_full_walk) =
-        get_cached_spec_scan_paths(project_root, include_patterns, changed_files, cache);
-    let (spec_roots, _) = build_scan_roots(project_root, include_patterns);
+        get_cached_spec_scan_paths(project_root, include_patterns, changed_files, cache, memo);
+    let spec_roots = if overlay.is_empty() {
+        Vec::new()
+    } else {
+        build_scan_roots(project_root, include_patterns).0
+    };
+    let mut overlay_added: BTreeSet<PathBuf> = BTreeSet::new();
     for overlay_path in overlay.keys() {
         if overlay_path
             .extension()
@@ -1032,16 +1252,24 @@ async fn load_rules_from_includes_cached(
         }
         if path_matches_any_root(overlay_path, &spec_roots) {
             spec_paths.insert(overlay_path.clone());
+            overlay_added.insert(overlay_path.clone());
         }
     }
 
     let mut all_rules = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut seen_ids: BTreeSet<String> = BTreeSet::new();
     let collected_paths: Vec<PathBuf> = spec_paths.into_iter().collect();
     for path in &collected_paths {
-        let extracted =
-            extract_spec_rules_cached(project_root, path, overlay, cache, quiet, stats).await?;
-        for rule in extracted {
+        let canonical = if overlay_added.contains(path) {
+            path.canonicalize().unwrap_or_else(|_| path.clone())
+        } else {
+            path.clone()
+        };
+        let parsed =
+            extract_spec_rules_cached(project_root, path, canonical, overlay, cache, quiet, stats)
+                .await?;
+        for rule in parsed.rules {
             let id = rule.def.id.to_string();
             if seen_ids.contains(&id) {
                 eyre::bail!(
@@ -1053,8 +1281,14 @@ async fn load_rules_from_includes_cached(
             seen_ids.insert(id);
             all_rules.push(rule);
         }
+        diagnostics.push((path.clone(), parsed.diagnostics));
     }
-    Ok((all_rules, collected_paths, did_full_walk))
+    Ok(LoadedSpecRules {
+        rules: all_rules,
+        paths: collected_paths,
+        diagnostics,
+        did_full_walk,
+    })
 }
 
 async fn scan_impl_files(
@@ -1065,37 +1299,49 @@ async fn scan_impl_files(
     cache: &mut BuildCache,
     changed_files: &[PathBuf],
     stats: &mut CacheStats,
+    memo: &mut WalkMemo,
 ) -> (
     Vec<ReqReference>,
     Vec<ParseWarning>,
     Vec<(PathBuf, String)>,
     Vec<String>,
     BTreeMap<PathBuf, Vec<CodeUnit>>,
-    BTreeMap<PathBuf, String>,
+    BTreeMap<PathBuf, Arc<str>>,
     BTreeMap<PathBuf, Reqs>,
     bool,
 ) {
     let (mut files, warnings, did_full_walk) =
-        get_cached_impl_scan_paths(project_root, include, exclude, changed_files, cache);
-    let (impl_roots, _) = build_scan_roots(project_root, include);
+        get_cached_impl_scan_paths(project_root, include, exclude, changed_files, cache, memo);
+    let impl_roots = if overlay.is_empty() {
+        Vec::new()
+    } else {
+        build_scan_roots(project_root, include).0
+    };
+    let mut overlay_added: BTreeSet<PathBuf> = BTreeSet::new();
     for overlay_path in overlay.keys() {
         if path_matches_any_root(overlay_path, &impl_roots)
             && !path_matches_excludes(overlay_path, &impl_roots, exclude)
         {
             files.insert(overlay_path.clone());
+            overlay_added.insert(overlay_path.clone());
         }
     }
     let mut refs = Vec::new();
     let mut parse_warnings = Vec::new();
     let mut parse_failures = Vec::new();
     let mut code_units_by_file: BTreeMap<PathBuf, Vec<CodeUnit>> = BTreeMap::new();
-    let mut file_contents: BTreeMap<PathBuf, String> = BTreeMap::new();
+    let mut file_contents: BTreeMap<PathBuf, Arc<str>> = BTreeMap::new();
     let mut reqs_by_file: BTreeMap<PathBuf, Reqs> = BTreeMap::new();
     let mut looked_up: Vec<(PathBuf, Result<SourceLookup, String>)> = Vec::new();
     for path in files {
         let found = match path.extension() {
             Some(ext) if is_supported_extension(ext) => {
-                lookup_source_file(&path, overlay, cache, stats)
+                let canonical = if overlay_added.contains(&path) {
+                    path.canonicalize().unwrap_or_else(|_| path.clone())
+                } else {
+                    path.clone()
+                };
+                lookup_source_file(&path, canonical, overlay, cache, stats)
                     .await
                     .map_err(|err| format!("failed to read/parse file: {err}"))
             }
@@ -1107,7 +1353,10 @@ async fn scan_impl_files(
         };
         looked_up.push((path, found));
     }
-    let scanned: Vec<(PathBuf, Result<(Option<PathBuf>, CachedSourceFile), String>)> = {
+    let scanned: Vec<(
+        PathBuf,
+        Result<(Option<PathBuf>, Arc<CachedSourceFile>), String>,
+    )> = {
         use rayon::prelude::*;
         let resolve = |(path, found): (PathBuf, Result<SourceLookup, String>)| {
             let file = found.map(|lookup| match lookup {
@@ -1132,7 +1381,7 @@ async fn scan_impl_files(
         match file {
             Ok((fresh, parsed)) => {
                 if let Some(canonical) = fresh {
-                    cache.source_files.insert(canonical, parsed.clone());
+                    cache.source_files.insert(canonical, Arc::clone(&parsed));
                     if let Some(on_disk) = &mut cache.on_disk {
                         on_disk.stale = true;
                     }
@@ -1144,12 +1393,12 @@ async fn scan_impl_files(
                         warnings: parsed.parse_warnings.clone(),
                     },
                 );
-                refs.extend(parsed.refs);
-                parse_warnings.extend(parsed.parse_warnings);
+                refs.extend(parsed.refs.iter().cloned());
+                parse_warnings.extend(parsed.parse_warnings.iter().cloned());
                 if !parsed.code_units.is_empty() {
-                    code_units_by_file.insert(path.clone(), parsed.code_units);
+                    code_units_by_file.insert(path.clone(), parsed.code_units.clone());
                 }
-                file_contents.insert(path, parsed.content);
+                file_contents.insert(path, Arc::clone(&parsed.content));
             }
             Err(message) => parse_failures.push((path, message)),
         }
@@ -1856,13 +2105,13 @@ fn source_reference_uses_explicit_verb(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn compute_workspace_diagnostics(
+fn compute_workspace_diagnostics(
     abs_root: &Path,
     config_path: &Path,
     config: &ApiConfig,
     forward_by_impl: &BTreeMap<ImplKey, ApiSpecForward>,
     source_reqs_by_file: &BTreeMap<PathBuf, Reqs>,
-    spec_file_contents: &BTreeMap<PathBuf, String>,
+    spec_diagnostics: &BTreeMap<PathBuf, Arc<SpecDiagnosticSource>>,
     source_issues: &BTreeMap<PathBuf, Vec<SourceDiagnosticIssue>>,
     include_parse_failures: &BTreeMap<PathBuf, String>,
 ) -> Vec<LspFileDiagnostics> {
@@ -1894,9 +2143,12 @@ async fn compute_workspace_diagnostics(
     }
 
     // Spec file diagnostics (coverage hints + cross-reference validation)
-    out.extend(
-        compute_spec_file_diagnostics(abs_root, config, forward_by_impl, spec_file_contents).await,
-    );
+    out.extend(compute_spec_file_diagnostics(
+        abs_root,
+        config,
+        forward_by_impl,
+        spec_diagnostics,
+    ));
 
     if !include_parse_failures.is_empty() {
         let config_rel_path = config_path
@@ -1966,183 +2218,179 @@ pub(crate) fn parse_inline_rule_reference(content: &str) -> Option<(String, Rule
 }
 
 /// Compute diagnostics for spec markdown files: coverage hints + cross-reference validation.
-async fn compute_spec_file_diagnostics(
+fn compute_spec_file_diagnostics(
     abs_root: &Path,
     config: &ApiConfig,
     forward_by_impl: &BTreeMap<ImplKey, ApiSpecForward>,
-    spec_file_contents: &BTreeMap<PathBuf, String>,
+    spec_diagnostics: &BTreeMap<PathBuf, Arc<SpecDiagnosticSource>>,
 ) -> Vec<LspFileDiagnostics> {
     let mut out = Vec::new();
 
-    // Build lookup structures
     let known_prefixes: std::collections::HashSet<&str> =
         config.specs.iter().map(|s| s.prefix.as_str()).collect();
     if known_prefixes.is_empty() {
         return out;
     }
 
-    let mut known_rules_by_prefix: HashMap<&str, Vec<RuleId>> = HashMap::new();
-    let mut rules_by_id: HashMap<RuleId, &ApiRule> = HashMap::new();
+    let mut known_rules_by_prefix: HashMap<&str, HashMap<&str, Vec<&RuleId>>> = HashMap::new();
+    let mut rules_by_id: HashMap<&RuleId, &ApiRule> = HashMap::new();
     for spec_cfg in &config.specs {
-        let rule_ids = known_rules_by_prefix
+        let rules_by_base = known_rules_by_prefix
             .entry(spec_cfg.prefix.as_str())
             .or_default();
         for ((spec_name, _), forward_data) in forward_by_impl {
             if spec_name == &spec_cfg.name {
                 for rule in &forward_data.rules {
-                    rule_ids.push(rule.id.clone());
-                    rules_by_id.entry(rule.id.clone()).or_insert(rule);
+                    rules_by_base
+                        .entry(rule.id.base.as_str())
+                        .or_default()
+                        .push(&rule.id);
+                    rules_by_id.entry(&rule.id).or_insert(rule);
                 }
             }
         }
     }
 
-    for (path, content) in spec_file_contents {
+    let mut best_rule_by_base: HashMap<&str, &ApiRule> = HashMap::new();
+    for forward_data in forward_by_impl.values() {
+        for rule in &forward_data.rules {
+            match best_rule_by_base.get(rule.id.base.as_str()) {
+                Some(current) if current.id.version >= rule.id.version => {}
+                _ => {
+                    best_rule_by_base.insert(rule.id.base.as_str(), rule);
+                }
+            }
+        }
+    }
+
+    let no_rules_by_base = HashMap::new();
+    for (path, source) in spec_diagnostics {
         let mut diagnostics = Vec::new();
 
-        // Coverage diagnostics: parse the spec doc to get requirement definitions
-        let fmt = SpecFormat::from_path(path).unwrap_or(SpecFormat::Markdown);
-        if let Ok(doc) = parse_spec(fmt, content).await {
-            let lines = LineIndex::new(content);
-            for def in &doc.reqs {
-                let (start_line, start_char, end_line, end_char) =
-                    lines.range(def.marker_span.offset, def.marker_span.length);
+        for (rule_id, (start_line, start_char, end_line, end_char)) in &source.definitions {
+            let (start_line, start_char, end_line, end_char) =
+                (*start_line, *start_char, *end_line, *end_char);
+            let Some(rule) = best_rule_by_base.get(rule_id.base.as_str()) else {
+                continue;
+            };
+            let impl_count = rule.impl_refs.len();
+            let verify_count = rule.verify_refs.len();
 
-                if let Some(rule_id) = parse_rule_id(&def.id.to_string()) {
-                    // Find the rule across all impls to check coverage
-                    let mut best_rule: Option<&ApiRule> = None;
-                    for ((_, _), forward_data) in forward_by_impl {
-                        for rule in &forward_data.rules {
-                            if rule.id.base == rule_id.base {
-                                match best_rule {
-                                    Some(current) if current.id.version >= rule.id.version => {}
-                                    _ => best_rule = Some(rule),
-                                }
-                            }
-                        }
+            if impl_count == 0 {
+                diagnostics.push(LspDiagnostic {
+                    severity: "hint".to_string(),
+                    code: "uncovered".to_string(),
+                    message: "Requirement has no implementations".to_string(),
+                    start_line,
+                    start_char,
+                    end_line,
+                    end_char,
+                });
+            } else if verify_count == 0 {
+                diagnostics.push(LspDiagnostic {
+                    severity: "hint".to_string(),
+                    code: "untested".to_string(),
+                    message: format!("Requirement has {impl_count} impl but no verification"),
+                    start_line,
+                    start_char,
+                    end_line,
+                    end_char,
+                });
+            }
+        }
+
+        for (prefix, req_id, (start_line, start_char, end_line, end_char)) in &source.references {
+            let (start_line, start_char, end_line, end_char) =
+                (*start_line, *start_char, *end_line, *end_char);
+
+            if !known_prefixes.contains(prefix.as_str()) {
+                diagnostics.push(LspDiagnostic {
+                    severity: "error".to_string(),
+                    code: "unknown-prefix".to_string(),
+                    message: format!("Unknown prefix: '{prefix}'"),
+                    start_line,
+                    start_char,
+                    end_line,
+                    end_char,
+                });
+                continue;
+            }
+
+            let known_by_base = known_rules_by_prefix
+                .get(prefix.as_str())
+                .unwrap_or(&no_rules_by_base);
+            let candidates = known_by_base
+                .get(req_id.base.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+
+            let mut stale_target: Option<&RuleId> = None;
+            let mut exact = false;
+            for rule_id in candidates {
+                match classify_reference_for_rule(rule_id, req_id) {
+                    RuleIdMatch::Exact => {
+                        exact = true;
+                        break;
                     }
-
-                    if let Some(rule) = best_rule {
-                        let impl_count = rule.impl_refs.len();
-                        let verify_count = rule.verify_refs.len();
-
-                        if impl_count == 0 {
-                            diagnostics.push(LspDiagnostic {
-                                severity: "hint".to_string(),
-                                code: "uncovered".to_string(),
-                                message: "Requirement has no implementations".to_string(),
-                                start_line,
-                                start_char,
-                                end_line,
-                                end_char,
-                            });
-                        } else if verify_count == 0 {
-                            diagnostics.push(LspDiagnostic {
-                                severity: "hint".to_string(),
-                                code: "untested".to_string(),
-                                message: format!(
-                                    "Requirement has {impl_count} impl but no verification"
-                                ),
-                                start_line,
-                                start_char,
-                                end_line,
-                                end_char,
-                            });
-                        }
+                    RuleIdMatch::Stale => {
+                        stale_target = Some(rule_id);
                     }
+                    RuleIdMatch::NoMatch => {}
                 }
             }
 
-            // Cross-reference validation: only backtick inline code spans like `r[auth.login]`
-            for code_span in &doc.inline_code_spans {
-                let Some((prefix, req_id)) = parse_inline_rule_reference(&code_span.content) else {
-                    continue;
-                };
-                let (start_line, start_char, end_line, end_char) =
-                    lines.range(code_span.span.offset, code_span.span.length);
+            if exact {
+                continue;
+            }
 
-                if !known_prefixes.contains(prefix.as_str()) {
-                    diagnostics.push(LspDiagnostic {
-                        severity: "error".to_string(),
-                        code: "unknown-prefix".to_string(),
-                        message: format!("Unknown prefix: '{prefix}'"),
-                        start_line,
-                        start_char,
-                        end_line,
-                        end_char,
-                    });
-                    continue;
-                }
-
-                let known_for_prefix = known_rules_by_prefix
-                    .get(prefix.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-
-                // Classify reference against known rules
-                let mut stale_target: Option<RuleId> = None;
-                let mut exact = false;
-                for rule_id in known_for_prefix {
-                    match classify_reference_for_rule(rule_id, &req_id) {
-                        RuleIdMatch::Exact => {
-                            exact = true;
-                            break;
-                        }
-                        RuleIdMatch::Stale => {
-                            stale_target = Some(rule_id.clone());
-                        }
-                        RuleIdMatch::NoMatch => {}
-                    }
-                }
-
-                if exact {
-                    continue;
-                }
-
-                if let Some(current_rule_id) = stale_target {
-                    let mut message = String::from(STALE_IMPLEMENTATION_MUST_CHANGE_PREFIX);
-                    if let Some(current_rule) = rules_by_id.get(&current_rule_id) {
-                        message.push_str(&format!(
-                            ". Reference '{}' is stale; current rule is '{}'.",
-                            req_id, current_rule.id
-                        ));
-                    } else {
-                        message.push_str(". The referenced annotation is stale, but the latest matching rule could not be loaded.");
-                    }
-                    diagnostics.push(LspDiagnostic {
-                        severity: "warning".to_string(),
-                        code: "stale".to_string(),
-                        message,
-                        start_line,
-                        start_char,
-                        end_line,
-                        end_char,
-                    });
+            if let Some(current_rule_id) = stale_target {
+                let mut message = String::from(STALE_IMPLEMENTATION_MUST_CHANGE_PREFIX);
+                if let Some(current_rule) = rules_by_id.get(current_rule_id) {
+                    message.push_str(&format!(
+                        ". Reference '{}' is stale; current rule is '{}'.",
+                        req_id, current_rule.id
+                    ));
                 } else {
-                    let suggestions = suggest_similar_rule_ids(&req_id, known_for_prefix, 3);
-                    let message = if suggestions.is_empty() {
-                        format!("Reference to unknown rule '{req_id}'")
-                    } else {
-                        format!(
-                            "Reference to unknown rule '{}' (did you mean: {})",
-                            req_id,
-                            suggestions
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    };
-                    diagnostics.push(LspDiagnostic {
-                        severity: "warning".to_string(),
-                        code: "orphaned".to_string(),
-                        message,
-                        start_line,
-                        start_char,
-                        end_line,
-                        end_char,
-                    });
+                    message.push_str(". The referenced annotation is stale, but the latest matching rule could not be loaded.");
                 }
+                diagnostics.push(LspDiagnostic {
+                    severity: "warning".to_string(),
+                    code: "stale".to_string(),
+                    message,
+                    start_line,
+                    start_char,
+                    end_line,
+                    end_char,
+                });
+            } else {
+                let known_for_prefix: Vec<RuleId> = known_by_base
+                    .values()
+                    .flatten()
+                    .map(|rule_id| (*rule_id).clone())
+                    .collect();
+                let suggestions = suggest_similar_rule_ids(req_id, &known_for_prefix, 3);
+                let message = if suggestions.is_empty() {
+                    format!("Reference to unknown rule '{req_id}'")
+                } else {
+                    format!(
+                        "Reference to unknown rule '{}' (did you mean: {})",
+                        req_id,
+                        suggestions
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                diagnostics.push(LspDiagnostic {
+                    severity: "warning".to_string(),
+                    code: "orphaned".to_string(),
+                    message,
+                    start_line,
+                    start_char,
+                    end_line,
+                    end_char,
+                });
             }
         }
 
@@ -2166,7 +2414,7 @@ fn compute_impl_output(
     _spec_name: &str,
     impl_name: String,
     inferred_prefix: &str,
-    extracted_rules: &[crate::ExtractedRule],
+    extracted_rules: &[Arc<crate::ExtractedRule>],
     refs: Vec<ReqReference>,
     impl_code_units: BTreeMap<PathBuf, Vec<CodeUnit>>,
 ) -> ImplComputedOutput {
@@ -2189,11 +2437,10 @@ fn compute_impl_output(
         let relative_display = relative_by_file
             .entry(r.file.as_path())
             .or_insert_with(|| {
-                let canonical_ref = r.file.canonicalize().unwrap_or_else(|_| r.file.clone());
-                if let Ok(rel) = canonical_ref.strip_prefix(abs_root) {
+                if let Ok(rel) = r.file.strip_prefix(abs_root) {
                     rel.display().to_string()
                 } else {
-                    compute_relative_path(abs_root, &canonical_ref)
+                    compute_relative_path(abs_root, &r.file)
                 }
             })
             .clone();
@@ -2430,6 +2677,7 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
     let mut cache_stats = CacheStats::default();
+    let mut walk_memo = WalkMemo::default();
 
     let mut api_config = ApiConfig {
         project_root: abs_root.display().to_string(),
@@ -2443,8 +2691,8 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
     let specs_content_by_impl: BTreeMap<ImplKey, ApiSpecData> = BTreeMap::new();
     let mut spec_includes_by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut format_config_by_spec: BTreeMap<String, FormatConfig> = BTreeMap::new();
-    let mut all_file_contents: BTreeMap<PathBuf, String> = BTreeMap::new();
-    let mut all_spec_file_contents: BTreeMap<PathBuf, String> = BTreeMap::new();
+    let mut all_file_contents: BTreeMap<PathBuf, Arc<str>> = BTreeMap::new();
+    let mut all_spec_diagnostics: BTreeMap<PathBuf, Arc<SpecDiagnosticSource>> = BTreeMap::new();
     let mut all_source_reqs_by_file: BTreeMap<PathBuf, Reqs> = BTreeMap::new();
     let mut source_files_by_impl: BTreeMap<ImplKey, BTreeSet<PathBuf>> = BTreeMap::new();
     let mut all_search_rules: Vec<search::RuleEntry> = Vec::new();
@@ -2478,16 +2726,14 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
             // excluded file is never treated as a test file.
             // r[impl config.impl.exclude]
             let (roots, _) = build_scan_roots(project_root, &impl_config.test_include);
+            let matchers = compile_excludes(&impl_config.exclude);
             for root_pattern in &roots {
-                for entry in root_pattern.walk().flatten() {
-                    if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                        continue;
-                    }
-                    let path = entry.path();
+                for file in walk_memo.files(root_pattern).iter() {
+                    let path = file.path.as_path();
                     if path_matches_root_pattern(path, root_pattern)
-                        && !path_matches_excludes(path, &roots, &impl_config.exclude)
+                        && exclude_match(path, &roots, &matchers).is_none()
                     {
-                        test_files.insert(path.to_path_buf());
+                        test_files.insert(file.path.clone());
                     }
                 }
             }
@@ -2541,26 +2787,26 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
                 include_patterns
             );
         }
-        let (extracted_rules, spec_file_paths, spec_walk_full_scan) =
-            load_rules_from_includes_cached(
-                project_root,
-                &include_patterns,
-                overlay,
-                cache,
-                quiet,
-                changed_files,
-                &mut cache_stats,
-            )
-            .await?;
+        let LoadedSpecRules {
+            rules: extracted_rules,
+            paths: spec_file_paths,
+            diagnostics: spec_diagnostics,
+            did_full_walk: spec_walk_full_scan,
+        } = load_rules_from_includes_cached(
+            project_root,
+            &include_patterns,
+            overlay,
+            cache,
+            quiet,
+            changed_files,
+            &mut cache_stats,
+            &mut walk_memo,
+        )
+        .await?;
         total_extracted_rules += extracted_rules.len();
 
-        // Collect spec file contents for workspace diagnostics
-        for spec_path in &spec_file_paths {
-            if !all_spec_file_contents.contains_key(spec_path)
-                && let Ok(content) = read_file_with_overlay(spec_path, overlay).await
-            {
-                all_spec_file_contents.insert(spec_path.clone(), content);
-            }
+        for (spec_path, diagnostics) in spec_diagnostics {
+            all_spec_diagnostics.entry(spec_path).or_insert(diagnostics);
         }
 
         let unique_prefixes: BTreeSet<String> =
@@ -2655,6 +2901,7 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
                 cache,
                 changed_files,
                 &mut cache_stats,
+                &mut walk_memo,
             )
             .await;
             for (path, reason) in parse_failures {
@@ -2688,6 +2935,7 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
                     cache,
                     changed_files,
                     &mut cache_stats,
+                    &mut walk_memo,
                 )
                 .await;
                 refs.extend(test_refs);
@@ -2829,52 +3077,6 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
         all_search_rules.len()
     );
 
-    // Compute content hash for change detection (hash all forward/reverse data)
-    let mut content_hash: u64 = 0;
-    for (key, forward) in &forward_by_impl {
-        let json = facet_json::to_string(forward).unwrap_or_default();
-        content_hash ^= simple_hash(&format!("{:?}:{}", key, json));
-    }
-    for (key, reverse) in &reverse_by_impl {
-        let json = facet_json::to_string(reverse).unwrap_or_default();
-        content_hash ^= simple_hash(&format!("{:?}:{}", key, json));
-    }
-
-    let source_ctx = build_source_diagnostic_context(&api_config, &forward_by_impl);
-    let source_issues: BTreeMap<PathBuf, Vec<SourceDiagnosticIssue>> = all_source_reqs_by_file
-        .iter()
-        .filter_map(|(path, reqs)| {
-            let content = all_file_contents.get(path)?;
-            let issues = collect_source_diagnostic_issues(
-                content,
-                reqs,
-                test_files.contains(path),
-                &source_ctx,
-            );
-            Some((path.clone(), issues))
-        })
-        .collect();
-    let validation_by_impl = compute_validation_by_impl(
-        &abs_root,
-        config_path,
-        &forward_by_impl,
-        &source_files_by_impl,
-        &all_source_reqs_by_file,
-        &source_issues,
-        &include_parse_failures_by_impl,
-    );
-    let workspace_diagnostics = compute_workspace_diagnostics(
-        &abs_root,
-        config_path,
-        &api_config,
-        &forward_by_impl,
-        &all_source_reqs_by_file,
-        &all_spec_file_contents,
-        &source_issues,
-        &include_parse_failures,
-    )
-    .await;
-
     let elapsed = build_start.elapsed();
     info!(
         "dashboard build done version={} specs={} impls={} rules={} refs={} code_files={} code_units={} cache_metadata_hits={} cache_hash_hits={} cache_misses={} reparsed_files={} cache_entries={} elapsed_ms={}",
@@ -2904,23 +3106,43 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
         search_files: all_file_contents,
         source_reqs_by_file: all_source_reqs_by_file,
         search_rules: all_search_rules,
-        validation_by_impl,
-        workspace_diagnostics,
+        diagnostic_inputs: DiagnosticInputs {
+            abs_root,
+            config_path: config_path.to_path_buf(),
+            spec_diagnostics: all_spec_diagnostics,
+            source_files_by_impl,
+            include_parse_failures,
+            include_parse_failures_by_impl,
+        },
+        diagnostics: std::sync::OnceLock::new(),
         version,
-        content_hash,
         delta: crate::server::Delta::default(),
         test_files,
     })
 }
 
-/// Simple FNV-1a hash for change detection
+/// 64-bit multiply-fold hash over eight-byte words, for change detection.
 fn simple_hash(s: &str) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in s.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+    const K0: u64 = 0xa076_1d64_78bd_642f;
+    const K1: u64 = 0xe703_7ed1_a0b4_28db;
+    fn fold(a: u64, b: u64) -> u64 {
+        let product = (a as u128).wrapping_mul(b as u128);
+        (product as u64) ^ ((product >> 64) as u64)
     }
-    hash
+    let bytes = s.as_bytes();
+    let mut hash = K0 ^ (bytes.len() as u64);
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunk of eight bytes"));
+        hash = fold(hash ^ word, K1);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut word = [0u8; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        hash = fold(hash ^ u64::from_le_bytes(word), K1);
+    }
+    fold(hash, K0)
 }
 
 /// Convert the per-spec [`FormatConfig`] schema into the type-erased
@@ -3292,7 +3514,7 @@ mod glob_tests {
         assert!(!path_matches_excludes(&source, &roots, &exclude));
 
         assert_eq!(
-            exclude_match(&fixture, &roots, &exclude),
+            exclude_match(&fixture, &roots, &compile_excludes(&exclude)),
             Some(ExcludeMatch::ProjectRelative)
         );
 
@@ -3301,7 +3523,7 @@ mod glob_tests {
         let legacy = ["foo/tests/fixtures/**".to_string()];
         assert!(path_matches_excludes(&fixture, &roots, &legacy));
         assert_eq!(
-            exclude_match(&fixture, &roots, &legacy),
+            exclude_match(&fixture, &roots, &compile_excludes(&legacy)),
             Some(ExcludeMatch::Legacy {
                 pattern: "foo/tests/fixtures/**".to_string(),
                 base: PathBuf::from("crates"),
@@ -3322,7 +3544,8 @@ mod glob_tests {
         let (roots, _) = build_scan_roots(root, &["crates/**/*.rs".to_string()]);
 
         let legacy = ["foo/tests/fixtures/**".to_string()];
-        let (files, warnings) = full_walk_for_roots(&roots, false, false, &legacy);
+        let (files, warnings) =
+            full_walk_for_roots(&roots, false, false, &legacy, &mut WalkMemo::default());
         assert_eq!(files.len(), 1, "{files:?}");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
@@ -3332,7 +3555,8 @@ mod glob_tests {
         );
 
         let modern = ["crates/foo/tests/fixtures/**".to_string()];
-        let (files, warnings) = full_walk_for_roots(&roots, false, false, &modern);
+        let (files, warnings) =
+            full_walk_for_roots(&roots, false, false, &modern, &mut WalkMemo::default());
         assert_eq!(files.len(), 1, "{files:?}");
         assert!(warnings.is_empty(), "{warnings:?}");
     }

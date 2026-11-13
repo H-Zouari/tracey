@@ -17,7 +17,7 @@ use config::Config;
 use eyre::{Result, WrapErr};
 use std::path::PathBuf;
 use tracey_core::ReqDefinition;
-use tracey_core::{SpecDoc, SpecFormat, extract_marker_prefix, parse_spec};
+use tracey_core::{SpecDoc, SpecFormat, extract_marker_prefix, parse_spec_with_flow_steps};
 
 /// Extracted rule with source location info
 #[derive(Clone)]
@@ -52,6 +52,7 @@ fn compute_column(content: &str, byte_offset: usize) -> usize {
 /// column for each. Shared by both the glob loader and the cached spec loader.
 pub(crate) fn doc_to_extracted_rules(
     doc: SpecDoc,
+    flow_steps: Vec<(String, Vec<String>)>,
     content: &str,
     fmt: SpecFormat,
     display_path: &str,
@@ -82,11 +83,7 @@ pub(crate) fn doc_to_extracted_rules(
         }
     }
 
-    let mut flow_steps: HashMap<String, Vec<String>> = if fmt == SpecFormat::Sdoc {
-        tracey_core::sdoc_flow_steps(content)?.into_iter().collect()
-    } else {
-        HashMap::new()
-    };
+    let mut flow_steps: HashMap<String, Vec<String>> = flow_steps.into_iter().collect();
 
     let mut extracted = Vec::with_capacity(doc.reqs.len());
     for req in doc.reqs {
@@ -211,11 +208,11 @@ pub async fn load_rules_from_glob(
         let content = std::fs::read_to_string(path)
             .wrap_err_with(|| format!("Failed to read {}", path.display()))?;
 
-        let doc = parse_spec(fmt, &content)
+        let (doc, flow_steps) = parse_spec_with_flow_steps(fmt, &content)
             .await
             .map_err(|e| eyre::eyre!("Failed to process {}: {}", path.display(), e))?;
 
-        let extracted = doc_to_extracted_rules(doc, &content, fmt, &display_path)?;
+        let extracted = doc_to_extracted_rules(doc, flow_steps, &content, fmt, &display_path)?;
         if !extracted.is_empty() {
             if !quiet {
                 eprintln!(

@@ -144,7 +144,7 @@ mod tantivy_impl {
         /// Build a new tantivy index from source files and rules
         pub fn build(
             project_root: &Path,
-            files: &BTreeMap<PathBuf, String>,
+            files: &BTreeMap<PathBuf, Arc<str>>,
             rules: &[RuleEntry],
         ) -> eyre::Result<Self> {
             // Define schema
@@ -420,7 +420,7 @@ impl SimpleIndex {
     /// Build a simple index from source files and rules
     pub fn build(
         project_root: &Path,
-        files: &BTreeMap<PathBuf, String>,
+        files: &BTreeMap<PathBuf, Arc<str>>,
         rules: &[RuleEntry],
     ) -> Self {
         let mut entries = Vec::new();
@@ -557,7 +557,7 @@ fn highlight_simple(content: &str, query: &str) -> String {
 #[cfg(feature = "search")]
 pub fn build_index(
     project_root: &Path,
-    files: &BTreeMap<PathBuf, String>,
+    files: &BTreeMap<PathBuf, Arc<str>>,
     rules: &[RuleEntry],
 ) -> Box<dyn SearchIndex> {
     match TantivyIndex::build(project_root, files, rules) {
@@ -575,7 +575,7 @@ pub fn build_index(
 #[cfg(not(feature = "search"))]
 pub fn build_index(
     project_root: &Path,
-    files: &BTreeMap<PathBuf, String>,
+    files: &BTreeMap<PathBuf, Arc<str>>,
     rules: &[RuleEntry],
 ) -> Box<dyn SearchIndex> {
     Box::new(SimpleIndex::build(project_root, files, rules))

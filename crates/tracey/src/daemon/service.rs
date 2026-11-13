@@ -27,7 +27,7 @@ struct HistoricalRuleText {
 struct TraceyServiceInner {
     engine: Arc<Engine>,
     /// Syntax highlighter for source files
-    highlighter: Mutex<arborium::Highlighter>,
+    highlighter: std::sync::OnceLock<Mutex<arborium::Highlighter>>,
     /// Watcher state for health monitoring
     watcher_state: Option<Arc<WatcherState>>,
     /// Start time for uptime calculation
@@ -51,7 +51,7 @@ impl TraceyService {
         Self {
             inner: Arc::new(TraceyServiceInner {
                 engine,
-                highlighter: Mutex::new(arborium::Highlighter::new()),
+                highlighter: std::sync::OnceLock::new(),
                 watcher_state: None,
                 start_time: Instant::now(),
                 shutdown_tx,
@@ -69,7 +69,7 @@ impl TraceyService {
         let service = Self {
             inner: Arc::new(TraceyServiceInner {
                 engine,
-                highlighter: Mutex::new(arborium::Highlighter::new()),
+                highlighter: std::sync::OnceLock::new(),
                 watcher_state: Some(watcher_state),
                 start_time: Instant::now(),
                 shutdown_tx,
@@ -625,7 +625,12 @@ impl TraceyDaemon for TraceyService {
 
         // Syntax highlight the content
         let html = if let Some(lang) = arborium_language(&relative) {
-            let mut hl = self.inner.highlighter.lock().unwrap();
+            let mut hl = self
+                .inner
+                .highlighter
+                .get_or_init(|| Mutex::new(arborium::Highlighter::new()))
+                .lock()
+                .unwrap();
             match hl.highlight(lang, &content) {
                 Ok(highlighted) => highlighted,
                 Err(_) => html_escape(&content),
@@ -818,7 +823,7 @@ impl TraceyDaemon for TraceyService {
         let (spec, impl_name) =
             self.resolve_spec_impl(req.spec.as_deref(), req.impl_name.as_deref(), &data.config);
 
-        data.validation_by_impl
+        data.validation_by_impl()
             .get(&(spec.clone(), impl_name.clone()))
             .cloned()
             .unwrap_or_else(|| ValidationResult {
@@ -1143,7 +1148,7 @@ impl TraceyDaemon for TraceyService {
     /// r[impl lsp.diagnostics.impl-in-test]
     async fn lsp_workspace_diagnostics(&self) -> Vec<LspFileDiagnostics> {
         let data = self.inner.engine.data().await;
-        data.workspace_diagnostics.clone()
+        data.workspace_diagnostics().to_vec()
     }
 
     /// Get document symbols (requirement references) in a file

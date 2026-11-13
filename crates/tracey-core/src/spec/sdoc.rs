@@ -131,7 +131,20 @@ impl SpecBackend for Sdoc {
 pub(super) async fn parse(content: &str) -> eyre::Result<SpecDoc> {
     let doc = strictdoc_parser::parse(content)
         .map_err(|e| eyre::eyre!("Failed to parse StrictDoc: {}", e))?;
-    let markup_is_markdown = is_markdown_markup(&doc);
+    spec_doc_of(&doc, content).await
+}
+
+pub(super) async fn parse_with_flow_steps(
+    content: &str,
+) -> eyre::Result<(SpecDoc, Vec<(String, Vec<String>)>)> {
+    let doc = strictdoc_parser::parse(content)
+        .map_err(|e| eyre::eyre!("Failed to parse StrictDoc: {}", e))?;
+    let spec_doc = spec_doc_of(&doc, content).await?;
+    Ok((spec_doc, flow_steps_of(&doc)))
+}
+
+async fn spec_doc_of(doc: &strictdoc_parser::Document, content: &str) -> eyre::Result<SpecDoc> {
+    let markup_is_markdown = is_markdown_markup(doc);
 
     let mut reqs = Vec::new();
     let mut headings = Vec::new();
@@ -586,7 +599,11 @@ pub fn versioned_sdoc_nodes(
 pub fn sdoc_flow_steps(content: &str) -> eyre::Result<Vec<(String, Vec<String>)>> {
     let doc = strictdoc_parser::parse(content)
         .map_err(|e| eyre::eyre!("Failed to parse StrictDoc: {}", e))?;
-    Ok(all_nodes(&doc.body)
+    Ok(flow_steps_of(&doc))
+}
+
+fn flow_steps_of(doc: &strictdoc_parser::Document) -> Vec<(String, Vec<String>)> {
+    all_nodes(&doc.body)
         .into_iter()
         .filter(|node| node.node_type == FLOW_ELEMENT)
         .filter_map(|flow| {
@@ -597,7 +614,7 @@ pub fn sdoc_flow_steps(content: &str) -> eyre::Result<Vec<(String, Vec<String>)>
                 .collect();
             Some((uid.to_owned(), steps))
         })
-        .collect())
+        .collect()
 }
 
 fn all_nodes(body: &[DocumentChild]) -> Vec<&Node> {

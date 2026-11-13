@@ -194,7 +194,7 @@ fn rule<'a>(data: &'a DashboardData, base: &str) -> &'a ApiRule {
 }
 
 fn errors_with(data: &DashboardData, code: ValidationErrorCode) -> Vec<(Option<String>, String)> {
-    data.validation_by_impl[&("fleet".to_string(), "rust".to_string())]
+    data.validation_by_impl()[&("fleet".to_string(), "rust".to_string())]
         .errors
         .iter()
         .filter(|e| e.code == code)

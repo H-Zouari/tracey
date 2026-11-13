@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use tracey_proto::TraceyDaemon as _;
+
 use super::{is_pid_alive, local_endpoint, pid_file_path, read_pid_file_at};
 
 // Re-export the generated client from tracey-proto
@@ -18,7 +20,13 @@ pub use tracey_proto::TraceyDaemonClient;
 #[derive(Clone)]
 pub struct DaemonClient {
     project_root: PathBuf,
-    in_process: Option<std::sync::Arc<tokio::sync::OnceCell<TraceyDaemonClient>>>,
+    in_process: Option<std::sync::Arc<InProcess>>,
+}
+
+#[derive(Default)]
+struct InProcess {
+    service: tokio::sync::OnceCell<super::TraceyService>,
+    client: tokio::sync::OnceCell<TraceyDaemonClient>,
 }
 
 /// Create a new daemon client for the given project root.
@@ -37,35 +45,57 @@ pub fn new_in_process_client(project_root: PathBuf) -> DaemonClient {
 }
 
 impl DaemonClient {
-    async fn in_process_client(
-        &self,
-        cell: &tokio::sync::OnceCell<TraceyDaemonClient>,
-    ) -> io::Result<TraceyDaemonClient> {
-        cell.get_or_try_init(|| async {
-            let config = self.project_root.join(".config/tracey/config.styx");
-            let engine = super::Engine::new(self.project_root.clone(), config)
-                .await
-                .map_err(|e| io::Error::other(format!("{e:?}")))?;
-            let service = super::TraceyService::new(std::sync::Arc::new(engine));
-            let (ours, theirs) = vox::memory_link_pair(64);
-            tokio::spawn(async move {
-                let dispatcher = super::service::TraceyDaemonDispatcher::new(service);
-                if let Ok(guard) = vox::acceptor_on(theirs)
-                    .on_connection(dispatcher)
+    async fn in_process_service(&self, in_process: &InProcess) -> io::Result<super::TraceyService> {
+        in_process
+            .service
+            .get_or_try_init(|| async {
+                let config = self.project_root.join(".config/tracey/config.styx");
+                let engine = super::Engine::new(self.project_root.clone(), config)
+                    .await
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
+                Ok(super::TraceyService::new(std::sync::Arc::new(engine)))
+            })
+            .await
+            .cloned()
+    }
+
+    async fn direct(&self) -> Result<Option<super::TraceyService>, vox::VoxError> {
+        let Some(in_process) = &self.in_process else {
+            return Ok(None);
+        };
+        match self.in_process_service(in_process).await {
+            Ok(service) => Ok(Some(service)),
+            Err(e) => {
+                eprintln!("tracey: {e}");
+                Err(vox::VoxError::Cancelled)
+            }
+        }
+    }
+
+    async fn in_process_client(&self, in_process: &InProcess) -> io::Result<TraceyDaemonClient> {
+        let service = self.in_process_service(in_process).await?;
+        in_process
+            .client
+            .get_or_try_init(|| async {
+                let (ours, theirs) = vox::memory_link_pair(64);
+                tokio::spawn(async move {
+                    let dispatcher = super::service::TraceyDaemonDispatcher::new(service);
+                    if let Ok(guard) = vox::acceptor_on(theirs)
+                        .on_connection(dispatcher)
+                        .establish::<TraceyDaemonClient>()
+                        .await
+                    {
+                        std::future::pending::<()>().await;
+                        drop(guard);
+                    }
+                });
+                vox::initiator_on(ours)
                     .establish::<TraceyDaemonClient>()
                     .await
-                {
-                    std::future::pending::<()>().await;
-                    drop(guard);
-                }
-            });
-            vox::initiator_on(ours)
-                .establish::<TraceyDaemonClient>()
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))
-        })
-        .await
-        .cloned()
+                    .map_err(|e| io::Error::other(e.to_string()))
+            })
+            .await
+            .cloned()
     }
 
     async fn connect_inner(&self) -> io::Result<vox::transport::local::LocalLink> {
@@ -158,12 +188,18 @@ impl DaemonClient {
     }
 
     pub async fn status(&self) -> Result<tracey_proto::StatusResponse, vox::VoxError> {
+        if let Some(service) = self.direct().await? {
+            return Ok(service.status().await);
+        }
         self.with_client(|c| async move { c.status().await }).await
     }
     pub async fn uncovered(
         &self,
         req: tracey_proto::UncoveredRequest,
     ) -> Result<tracey_proto::UncoveredResponse, vox::VoxError> {
+        if let Some(service) = self.direct().await? {
+            return Ok(service.uncovered(req).await);
+        }
         self.with_client(|c| async move { c.uncovered(req).await })
             .await
     }
@@ -171,6 +207,9 @@ impl DaemonClient {
         &self,
         req: tracey_proto::UntestedRequest,
     ) -> Result<tracey_proto::UntestedResponse, vox::VoxError> {
+        if let Some(service) = self.direct().await? {
+            return Ok(service.untested(req).await);
+        }
         self.with_client(|c| async move { c.untested(req).await })
             .await
     }
@@ -178,6 +217,9 @@ impl DaemonClient {
         &self,
         req: tracey_proto::StaleRequest,
     ) -> Result<tracey_proto::StaleResponse, vox::VoxError> {
+        if let Some(service) = self.direct().await? {
+            return Ok(service.stale(req).await);
+        }
         self.with_client(|c| async move { c.stale(req).await })
             .await
     }
@@ -185,6 +227,9 @@ impl DaemonClient {
         &self,
         req: tracey_proto::UnmappedRequest,
     ) -> Result<tracey_proto::UnmappedResponse, vox::VoxError> {
+        if let Some(service) = self.direct().await? {
+            return Ok(service.unmapped(req).await);
+        }
         self.with_client(|c| async move { c.unmapped(req).await })
             .await
     }
@@ -192,10 +237,16 @@ impl DaemonClient {
         &self,
         rule_id: tracey_core::RuleId,
     ) -> Result<Option<tracey_proto::RuleInfo>, vox::VoxError> {
+        if let Some(service) = self.direct().await? {
+            return Ok(service.rule(rule_id).await);
+        }
         self.with_client(|c| async move { c.rule(rule_id).await })
             .await
     }
     pub async fn config(&self) -> Result<tracey_api::ApiConfig, vox::VoxError> {
+        if let Some(service) = self.direct().await? {
+            return Ok(service.config().await);
+        }
         self.with_client(|c| async move { c.config().await }).await
     }
     pub async fn vfs_open(&self, path: String, content: String) -> Result<(), vox::VoxError> {
@@ -217,6 +268,9 @@ impl DaemonClient {
         self.with_client(|c| async move { c.version().await }).await
     }
     pub async fn health(&self) -> Result<tracey_proto::HealthResponse, vox::VoxError> {
+        if let Some(service) = self.direct().await? {
+            return Ok(service.health().await);
+        }
         self.with_client(|c| async move { c.health().await }).await
     }
     pub async fn shutdown(&self) -> Result<(), vox::VoxError> {
@@ -387,6 +441,9 @@ impl DaemonClient {
         &self,
         req: tracey_proto::ValidateRequest,
     ) -> Result<tracey_api::ValidationResult, vox::VoxError> {
+        if let Some(service) = self.direct().await? {
+            return Ok(service.validate(req).await);
+        }
         self.with_client(|c| async move { c.validate(req).await })
             .await
     }

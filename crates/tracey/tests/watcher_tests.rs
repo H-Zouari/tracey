@@ -360,7 +360,7 @@ async fn test_rebuild_add_rule_to_spec_resolves_orphan() {
     // Before: payment.checkout should be orphaned
     let data = engine.data().await;
     assert!(
-        has_diagnostic_with_code(&data.workspace_diagnostics, "orphaned", "payment.checkout"),
+        has_diagnostic_with_code(data.workspace_diagnostics(), "orphaned", "payment.checkout"),
         "Expected orphaned diagnostic for payment.checkout before adding rule"
     );
 
@@ -384,7 +384,7 @@ async fn test_rebuild_add_rule_to_spec_resolves_orphan() {
         "Expected payment.checkout in forward data after adding rule to spec"
     );
     assert!(
-        !has_diagnostic_with_code(&data.workspace_diagnostics, "orphaned", "payment.checkout"),
+        !has_diagnostic_with_code(data.workspace_diagnostics(), "orphaned", "payment.checkout"),
         "Expected no orphaned diagnostic for payment.checkout after adding rule"
     );
 }
@@ -417,9 +417,9 @@ async fn test_rebuild_typst_spec_resolves_orphan() {
     // Before: payment.checkout should be orphaned
     let data = engine.data().await;
     assert!(
-        has_diagnostic_with_code(&data.workspace_diagnostics, "orphaned", "payment.checkout"),
+        has_diagnostic_with_code(data.workspace_diagnostics(), "orphaned", "payment.checkout"),
         "Expected orphaned diagnostic for payment.checkout before adding rule; got {:#?}",
-        data.workspace_diagnostics
+        data.workspace_diagnostics()
     );
 
     // Add payment.checkout to the typst spec
@@ -442,7 +442,7 @@ async fn test_rebuild_typst_spec_resolves_orphan() {
         "Expected payment.checkout in forward data after adding rule to typst spec"
     );
     assert!(
-        !has_diagnostic_with_code(&data.workspace_diagnostics, "orphaned", "payment.checkout"),
+        !has_diagnostic_with_code(data.workspace_diagnostics(), "orphaned", "payment.checkout"),
         "Expected no orphaned diagnostic for payment.checkout after adding rule"
     );
 }
@@ -471,7 +471,7 @@ async fn test_rebuild_remove_rule_from_spec_creates_orphan() {
     // Before: no orphaned diagnostics for auth.logout
     let data = engine.data().await;
     assert!(
-        !has_diagnostic_with_code(&data.workspace_diagnostics, "orphaned", "auth.logout"),
+        !has_diagnostic_with_code(data.workspace_diagnostics(), "orphaned", "auth.logout"),
         "Expected no orphaned diagnostic for auth.logout initially"
     );
 
@@ -488,7 +488,7 @@ async fn test_rebuild_remove_rule_from_spec_creates_orphan() {
     // After: auth.logout should be orphaned
     let data = engine.data().await;
     assert!(
-        has_diagnostic_with_code(&data.workspace_diagnostics, "orphaned", "auth.logout"),
+        has_diagnostic_with_code(data.workspace_diagnostics(), "orphaned", "auth.logout"),
         "Expected orphaned diagnostic for auth.logout after removing rule from spec"
     );
 }
@@ -569,7 +569,7 @@ async fn test_rebuild_modify_source_file() {
     // Before: nonexistent.rule should be orphaned
     let data = engine.data().await;
     assert!(
-        has_diagnostic_with_code(&data.workspace_diagnostics, "orphaned", "nonexistent.rule"),
+        has_diagnostic_with_code(data.workspace_diagnostics(), "orphaned", "nonexistent.rule"),
         "Expected orphaned diagnostic for nonexistent.rule initially"
     );
 
@@ -589,7 +589,7 @@ async fn test_rebuild_modify_source_file() {
     // After: no more orphaned diagnostic, and auth.login has impl refs
     let data = engine.data().await;
     assert!(
-        !has_diagnostic_with_code(&data.workspace_diagnostics, "orphaned", "nonexistent.rule"),
+        !has_diagnostic_with_code(data.workspace_diagnostics(), "orphaned", "nonexistent.rule"),
         "Expected no orphaned diagnostic for nonexistent.rule after modifying source"
     );
     assert!(
@@ -689,7 +689,7 @@ async fn test_validation_checks_files_without_code_units_in_their_own_impl_only(
         .expect("engine");
     let data = engine.data().await;
     let unknown_requirement_files = |impl_name: &str| -> Vec<Option<String>> {
-        data.validation_by_impl[&("test".to_string(), impl_name.to_string())]
+        data.validation_by_impl()[&("test".to_string(), impl_name.to_string())]
             .errors
             .iter()
             .filter(|e| e.code == ValidationErrorCode::UnknownRequirement)

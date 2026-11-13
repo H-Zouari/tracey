@@ -510,10 +510,7 @@ async fn run(args: Args) -> Result<()> {
             if json {
                 let (output, has_errors) = query_json(&query_client, query).await;
                 println!("{}", output);
-                if has_errors {
-                    std::process::exit(1);
-                }
-                return Ok(());
+                std::process::exit(i32::from(has_errors));
             }
 
             let (output, has_errors) = match query {
@@ -553,10 +550,7 @@ async fn run(args: Args) -> Result<()> {
             };
 
             println!("{}", output);
-            if has_errors {
-                std::process::exit(1);
-            }
-            Ok(())
+            std::process::exit(i32::from(has_errors));
         }
 
         Command::Gc { dry_run } => run_gc(dry_run),
