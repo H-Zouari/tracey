@@ -282,6 +282,14 @@ enum QueryCommand {
     /// Display current configuration
     Config,
 
+    /// Run several queries over one read of the project (JSON only)
+    Batch {
+        /// Queries to run, in order: status, stale, uncovered, untested, unmapped, validate,
+        /// config, or rule:<id>,<id>,... The output is one JSON object with one member per query.
+        #[facet(args::positional)]
+        queries: Vec<String>,
+    },
+
     /// Validate the spec and implementation
     Validate {
         /// Spec/impl to validate (e.g., "my-spec/rust"). Optional if only one exists.
@@ -541,6 +549,7 @@ async fn run(args: Args) -> Result<()> {
                 ),
                 QueryCommand::Rule { rule_ids } => (query_client.rules(&rule_ids).await, false),
                 QueryCommand::Config => (query_client.config().await, false),
+                QueryCommand::Batch { .. } => (json_error("batch needs --json"), true),
                 QueryCommand::Validate { spec_impl, deny } => {
                     let deny = ValidationDeny::parse(&deny)?;
                     query_client
@@ -741,6 +750,57 @@ async fn query_json(qc: &bridge::query::QueryClient, query: QueryCommand) -> (St
             ),
             Err(e) => (json_error(&format!("{e:?}")), false),
         },
+        QueryCommand::Batch { queries } => {
+            let mut members: Vec<(String, String)> = Vec::new();
+            let mut any_errors = false;
+            for token in &queries {
+                let (name, rest) = token.split_once(':').unwrap_or((token.as_str(), ""));
+                if members.iter().any(|(seen, _)| seen == name) {
+                    return (json_error(&format!("query given twice: {name}")), true);
+                }
+                let query = match name {
+                    "status" => QueryCommand::Status,
+                    "stale" => QueryCommand::Stale {
+                        spec_impl: None,
+                        prefix: None,
+                    },
+                    "uncovered" => QueryCommand::Uncovered {
+                        spec_impl: None,
+                        prefix: None,
+                    },
+                    "untested" => QueryCommand::Untested {
+                        spec_impl: None,
+                        prefix: None,
+                    },
+                    "unmapped" => QueryCommand::Unmapped {
+                        spec_impl: None,
+                        path: None,
+                    },
+                    "validate" => QueryCommand::Validate {
+                        spec_impl: None,
+                        deny: Vec::new(),
+                    },
+                    "config" => QueryCommand::Config,
+                    "rule" => QueryCommand::Rule {
+                        rule_ids: rest
+                            .split(',')
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                            .collect(),
+                    },
+                    _ => return (json_error(&format!("unknown query: {token}")), true),
+                };
+                let (output, has_errors) = Box::pin(query_json(qc, query)).await;
+                any_errors |= has_errors;
+                members.push((name.to_owned(), output));
+            }
+            let body = members
+                .iter()
+                .map(|(name, output)| format!("  \"{name}\": {}", output.replace('\n', "\n  ")))
+                .collect::<Vec<_>>()
+                .join(",\n");
+            (format!("{{\n{body}\n}}"), any_errors)
+        }
         QueryCommand::Validate { spec_impl, deny } => {
             let deny = match ValidationDeny::parse(&deny) {
                 Ok(deny) => deny,
