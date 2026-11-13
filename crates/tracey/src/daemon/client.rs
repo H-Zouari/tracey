@@ -18,14 +18,57 @@ pub use tracey_proto::TraceyDaemonClient;
 #[derive(Clone)]
 pub struct DaemonClient {
     project_root: PathBuf,
+    in_process: Option<std::sync::Arc<tokio::sync::OnceCell<super::TraceyService>>>,
 }
 
 /// Create a new daemon client for the given project root.
 pub fn new_client(project_root: PathBuf) -> DaemonClient {
-    DaemonClient { project_root }
+    DaemonClient {
+        project_root,
+        in_process: None,
+    }
+}
+
+pub fn new_in_process_client(project_root: PathBuf) -> DaemonClient {
+    DaemonClient {
+        project_root,
+        in_process: Some(Default::default()),
+    }
 }
 
 impl DaemonClient {
+    async fn in_process_client(
+        &self,
+        service: &tokio::sync::OnceCell<super::TraceyService>,
+    ) -> io::Result<TraceyDaemonClient> {
+        let service = service
+            .get_or_try_init(|| async {
+                let config = self.project_root.join(".config/tracey/config.styx");
+                let engine = super::Engine::new(self.project_root.clone(), config)
+                    .await
+                    .map_err(|e| io::Error::other(format!("{e:?}")))?;
+                Ok::<_, io::Error>(super::TraceyService::new(std::sync::Arc::new(engine)))
+            })
+            .await?
+            .clone();
+        let (ours, theirs) = vox::memory_link_pair(64);
+        tokio::spawn(async move {
+            let dispatcher = super::service::TraceyDaemonDispatcher::new(service);
+            if let Ok(guard) = vox::acceptor_on(theirs)
+                .on_connection(dispatcher)
+                .establish::<TraceyDaemonClient>()
+                .await
+            {
+                std::future::pending::<()>().await;
+                drop(guard);
+            }
+        });
+        vox::initiator_on(ours)
+            .establish::<TraceyDaemonClient>()
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
     async fn connect_inner(&self) -> io::Result<vox::transport::local::LocalLink> {
         let start = Instant::now();
         debug!(
@@ -52,6 +95,15 @@ impl DaemonClient {
             callsite = format_args!("{}:{}", callsite.file(), callsite.line()),
             "daemon client: with_client start"
         );
+        if let Some(service) = &self.in_process {
+            return match self.in_process_client(service).await {
+                Ok(client) => f(client).await,
+                Err(e) => {
+                    eprintln!("tracey: {e}");
+                    Err(vox::VoxError::Cancelled)
+                }
+            };
+        }
         let stream = match self.connect_inner().await {
             Ok(stream) => stream,
             Err(e) => {

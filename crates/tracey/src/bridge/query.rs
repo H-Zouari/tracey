@@ -118,6 +118,13 @@ impl QueryClient {
         }
     }
 
+    pub fn in_process(project_root: PathBuf, caller: Caller) -> Self {
+        Self {
+            client: crate::daemon::client::new_in_process_client(project_root),
+            caller,
+        }
+    }
+
     /// Check for config errors and return a warning banner if present.
     async fn get_config_error_banner(&self) -> Option<String> {
         match self.client.health().await {

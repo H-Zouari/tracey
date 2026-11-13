@@ -147,6 +147,10 @@ enum Command {
         #[facet(args::named, default)]
         json: bool,
 
+        /// Read the project inside this process instead of asking a daemon
+        #[facet(rename = "no-daemon", args::named, default)]
+        no_daemon: bool,
+
         /// Query command to run
         #[facet(args::subcommand)]
         query: QueryCommand,
@@ -474,10 +478,18 @@ async fn main() -> Result<()> {
         }
 
         // r[impl daemon.cli.query]
-        Command::Query { root, json, query } => {
+        Command::Query {
+            root,
+            json,
+            no_daemon,
+            query,
+        } => {
             let project_root = root.unwrap_or_else(|| find_project_root().unwrap_or_default());
-            let query_client =
-                bridge::query::QueryClient::new(project_root, bridge::query::Caller::Cli);
+            let query_client = if no_daemon {
+                bridge::query::QueryClient::in_process(project_root, bridge::query::Caller::Cli)
+            } else {
+                bridge::query::QueryClient::new(project_root, bridge::query::Caller::Cli)
+            };
             init_tracing(TracingConfig {
                 log_file: None,
                 enable_console: !json,
