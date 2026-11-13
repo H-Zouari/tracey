@@ -23,9 +23,6 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
-      # A fixed load address cuts start-up from 6.4 to 1.3 ms. Linking statically keeps nix from
-      # patching the binary, which crashed it at a fixed address. The explicit --target keeps the
-      # flags off proc macros, which must stay relocatable.
       - run: cargo build --release --locked -p tracey --no-default-features --target x86_64-unknown-linux-gnu
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C relocation-model=static -C target-feature=+crt-static
