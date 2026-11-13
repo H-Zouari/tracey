@@ -22,8 +22,8 @@ pub struct Lang {
     pub extensions: &'static [&'static str],
     /// Tree-sitter grammar for comment-aware ref extraction.
     pub grammar: fn() -> arborium_tree_sitter::LanguageFn,
-    /// Structural extraction (functions, types, etc.) for reverse coverage.
-    pub extract: fn(&Path, &str) -> CodeUnits,
+    /// Walks a parsed tree for structural units (functions, types, etc.) for reverse coverage.
+    pub walk: fn(&Path, &str, arborium_tree_sitter::Node, &mut CodeUnits),
     pub injections: Option<&'static str>,
 }
 
@@ -101,7 +101,7 @@ macro_rules! define_languages {
             $( Lang {
                 extensions: &[$($ext),+],
                 grammar: $grammar,
-                extract: $extract,
+                walk: $extract,
                 injections: __opt!($($inj)?),
             }, )*
         ];
@@ -109,45 +109,45 @@ macro_rules! define_languages {
 }
 
 define_languages! {
-    ["rs"]                                  => arborium_rust::language,       code_units::extract_rust,       arborium = "rust",       devicon = "devicon-rust-original";
-    ["swift"]                               => arborium_swift::language,      code_units::extract_swift,      arborium = "swift",      devicon = "devicon-swift-plain";
-    ["go"]                                  => arborium_go::language,         code_units::extract_go,         arborium = "go",         devicon = "devicon-go-plain";
-    ["java"]                                => arborium_java::language,       code_units::extract_java,       arborium = "java",       devicon = "devicon-java-plain";
-    ["py"]                                  => arborium_python::language,     code_units::extract_python,     arborium = "python",     devicon = "devicon-python-plain";
+    ["rs"]                                  => arborium_rust::language,       code_units::walk_rust,       arborium = "rust",       devicon = "devicon-rust-original";
+    ["swift"]                               => arborium_swift::language,      code_units::walk_swift,      arborium = "swift",      devicon = "devicon-swift-plain";
+    ["go"]                                  => arborium_go::language,         code_units::walk_go,         arborium = "go",         devicon = "devicon-go-plain";
+    ["java"]                                => arborium_java::language,       code_units::walk_java,       arborium = "java",       devicon = "devicon-java-plain";
+    ["py"]                                  => arborium_python::language,     code_units::walk_python,     arborium = "python",     devicon = "devicon-python-plain";
     // ts/js/jsx share one grammar but differ in highlight name + icon, so the
     // row leaves both `None` and callers fall through to a residual match.
-    ["ts", "tsx", "js", "jsx", "mts", "cts"] => arborium_typescript::language, code_units::extract_typescript;
-    ["php"]                                 => arborium_php::language,        code_units::extract_php,        arborium = "php",        devicon = "devicon-php-plain";
-    ["c", "h"]                              => arborium_c::language,          code_units::extract_c,          arborium = "c",          devicon = "devicon-c-plain";
-    ["cpp", "cc", "cxx", "hpp"]             => arborium_cpp::language,        code_units::extract_cpp,        arborium = "cpp",        devicon = "devicon-cplusplus-plain";
-    ["rb"]                                  => arborium_ruby::language,       code_units::extract_ruby,       arborium = "ruby",       devicon = "devicon-ruby-plain";
-    ["r", "R"]                              => arborium_r::language,          code_units::extract_r,          arborium = "r",          devicon = "devicon-r-plain";
-    ["dart"]                                => arborium_dart::language,       code_units::extract_dart,       arborium = "dart",       devicon = "devicon-dart-plain";
-    ["lua"]                                 => arborium_lua::language,        code_units::extract_lua,        arborium = "lua",        devicon = "devicon-lua-plain";
-    ["asm", "s", "S"]                       => arborium_asm::language,        code_units::extract_asm,        arborium = "asm";
-    ["pl", "pm"]                            => arborium_perl::language,       code_units::extract_perl,       arborium = "perl",       devicon = "devicon-perl-plain";
-    ["hs", "lhs"]                           => arborium_haskell::language,    code_units::extract_haskell,    arborium = "haskell",    devicon = "devicon-haskell-plain";
-    ["ex", "exs"]                           => arborium_elixir::language,     code_units::extract_elixir,     arborium = "elixir",     devicon = "devicon-elixir-plain";
-    ["erl", "hrl"]                          => arborium_erlang::language,     code_units::extract_erlang,     arborium = "erlang",     devicon = "devicon-erlang-plain";
-    ["clj", "cljs", "cljc", "edn"]          => arborium_clojure::language,    code_units::extract_clojure,    arborium = "clojure",    devicon = "devicon-clojure-plain";
-    ["fs", "fsi", "fsx"]                    => arborium_fsharp::language,     code_units::extract_fsharp,     arborium = "fsharp",     devicon = "devicon-fsharp-plain";
-    ["vb", "vbs"]                           => arborium_vb::language,         code_units::extract_vb,         arborium = "vb";
-    ["cob", "cbl", "cpy"]                   => arborium_cobol::language,      code_units::extract_cobol,      arborium = "cobol";
-    ["jl"]                                  => arborium_julia::language,      code_units::extract_julia,      arborium = "julia",      devicon = "devicon-julia-plain";
-    ["d"]                                   => arborium_d::language,          code_units::extract_d,          arborium = "d";
-    ["ps1", "psm1", "psd1"]                 => arborium_powershell::language, code_units::extract_powershell, arborium = "powershell", devicon = "devicon-powershell-plain";
-    ["cmake"]                               => arborium_cmake::language,      code_units::extract_cmake,      arborium = "cmake";
-    ["ml", "mli"]                           => arborium_ocaml::language,      code_units::extract_ocaml,      arborium = "ocaml",      devicon = "devicon-ocaml-plain";
-    ["sh", "bash", "zsh"]                   => arborium_bash::language,       code_units::extract_bash,       arborium = "bash",       devicon = "devicon-bash-plain";
-    ["nix"]                                 => arborium_nix::language,        code_units::extract_nix,        arborium = "nix";
-    ["lean"]                                => arborium_lean::language,       code_units::extract_lean,       arborium = "lean";
-    ["svelte"]                              => arborium_svelte::language,     code_units::extract_svelte,     arborium = "svelte",     injections = arborium_svelte::INJECTIONS_QUERY;
+    ["ts", "tsx", "js", "jsx", "mts", "cts"] => arborium_typescript::language, code_units::walk_typescript;
+    ["php"]                                 => arborium_php::language,        code_units::walk_php,        arborium = "php",        devicon = "devicon-php-plain";
+    ["c", "h"]                              => arborium_c::language,          code_units::walk_c,          arborium = "c",          devicon = "devicon-c-plain";
+    ["cpp", "cc", "cxx", "hpp"]             => arborium_cpp::language,        code_units::walk_cpp,        arborium = "cpp",        devicon = "devicon-cplusplus-plain";
+    ["rb"]                                  => arborium_ruby::language,       code_units::walk_ruby,       arborium = "ruby",       devicon = "devicon-ruby-plain";
+    ["r", "R"]                              => arborium_r::language,          code_units::walk_r,          arborium = "r",          devicon = "devicon-r-plain";
+    ["dart"]                                => arborium_dart::language,       code_units::walk_dart,       arborium = "dart",       devicon = "devicon-dart-plain";
+    ["lua"]                                 => arborium_lua::language,        code_units::walk_lua,        arborium = "lua",        devicon = "devicon-lua-plain";
+    ["asm", "s", "S"]                       => arborium_asm::language,        code_units::walk_asm,        arborium = "asm";
+    ["pl", "pm"]                            => arborium_perl::language,       code_units::walk_perl,       arborium = "perl",       devicon = "devicon-perl-plain";
+    ["hs", "lhs"]                           => arborium_haskell::language,    code_units::walk_haskell,    arborium = "haskell",    devicon = "devicon-haskell-plain";
+    ["ex", "exs"]                           => arborium_elixir::language,     code_units::walk_elixir,     arborium = "elixir",     devicon = "devicon-elixir-plain";
+    ["erl", "hrl"]                          => arborium_erlang::language,     code_units::walk_erlang,     arborium = "erlang",     devicon = "devicon-erlang-plain";
+    ["clj", "cljs", "cljc", "edn"]          => arborium_clojure::language,    code_units::walk_clojure,    arborium = "clojure",    devicon = "devicon-clojure-plain";
+    ["fs", "fsi", "fsx"]                    => arborium_fsharp::language,     code_units::walk_fsharp,     arborium = "fsharp",     devicon = "devicon-fsharp-plain";
+    ["vb", "vbs"]                           => arborium_vb::language,         code_units::walk_vb,         arborium = "vb";
+    ["cob", "cbl", "cpy"]                   => arborium_cobol::language,      code_units::walk_cobol,      arborium = "cobol";
+    ["jl"]                                  => arborium_julia::language,      code_units::walk_julia,      arborium = "julia",      devicon = "devicon-julia-plain";
+    ["d"]                                   => arborium_d::language,          code_units::walk_d,          arborium = "d";
+    ["ps1", "psm1", "psd1"]                 => arborium_powershell::language, code_units::walk_powershell, arborium = "powershell", devicon = "devicon-powershell-plain";
+    ["cmake"]                               => arborium_cmake::language,      code_units::walk_cmake,      arborium = "cmake";
+    ["ml", "mli"]                           => arborium_ocaml::language,      code_units::walk_ocaml,      arborium = "ocaml",      devicon = "devicon-ocaml-plain";
+    ["sh", "bash", "zsh"]                   => arborium_bash::language,       code_units::walk_bash,       arborium = "bash",       devicon = "devicon-bash-plain";
+    ["nix"]                                 => arborium_nix::language,        code_units::walk_nix,        arborium = "nix";
+    ["lean"]                                => arborium_lean::language,       code_units::walk_lean,       arborium = "lean";
+    ["svelte"]                              => arborium_svelte::language,     code_units::walk_svelte,     arborium = "svelte",     injections = arborium_svelte::INJECTIONS_QUERY;
     // YAML and JSON5 are config/data formats: they carry requirement refs in
     // comments (scanned via the grammar) but expose no structural code units,
     // so they share the no-op `extract_config`. JSON5 reuses the TS grammar for
     // its `//` and `/* */` comments.
-    ["yml", "yaml"]                         => arborium_yaml::language,       code_units::extract_config,     arborium = "yaml";
-    ["json5"]                               => arborium_typescript::language, code_units::extract_config;
+    ["yml", "yaml"]                         => arborium_yaml::language,       code_units::walk_config,     arborium = "yaml";
+    ["json5"]                               => arborium_typescript::language, code_units::walk_config;
 
     // Extensions scanned by the text-based lexer fallback only (no tree-sitter
     // grammar wired up yet). Kept for backwards compatibility — promote to a

@@ -149,41 +149,76 @@ impl CodeUnits {
     }
 }
 
-/// Extract code units from source code, auto-detecting language from file extension
-pub fn extract(path: &Path, source: &str) -> CodeUnits {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let Some(lang) = crate::languages::for_ext(ext) else {
-        return CodeUnits::new();
-    };
-    let mut units = (lang.extract)(path, source);
-    if let Some(query) = lang.injections {
-        extend_with_injected_units(path, source, lang, query, &mut units);
+thread_local! {
+    static PARSER: std::cell::RefCell<Parser> = std::cell::RefCell::new(Parser::new());
+}
+
+fn parse(language: &Language, source: &str) -> Option<arborium::tree_sitter::Tree> {
+    PARSER.with_borrow_mut(|parser| {
+        parser
+            .set_language(language)
+            .expect("Failed to load grammar");
+        parser.parse(source, None)
+    })
+}
+
+fn units_with(
+    path: &Path,
+    source: &str,
+    grammar: fn() -> arborium_tree_sitter::LanguageFn,
+    walk: fn(&Path, &str, Node, &mut CodeUnits),
+) -> CodeUnits {
+    let mut units = CodeUnits::new();
+    if let Some(tree) = parse(&grammar().into(), source) {
+        walk(path, source, tree.root_node(), &mut units);
     }
     units
 }
 
-fn extend_with_injected_units(
+fn units_of_tree(
     path: &Path,
     source: &str,
     lang: &Lang,
-    query: &str,
-    units: &mut CodeUnits,
-) {
-    let language: Language = (lang.grammar)().into();
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language)
-        .expect("Failed to load grammar");
-
-    // Parsed a second time because each language's extractor keeps its tree; sharing one would change all 33.
-    let Some(tree) = parser.parse(source, None) else {
-        return;
-    };
-    for injection in parse_injections(query, &language, tree.root_node(), source) {
-        let root = injection.tree.root_node();
-        extract_units_recursive(path, source, root, units, injection.lang.node_kind);
+    root: Node,
+    injections: &[crate::injections::Injection],
+) -> CodeUnits {
+    let mut units = CodeUnits::new();
+    (lang.walk)(path, source, root, &mut units);
+    for injection in injections {
+        extract_units_recursive(
+            path,
+            source,
+            injection.tree.root_node(),
+            &mut units,
+            injection.lang.node_kind,
+        );
     }
-    units.units.sort_by_key(|u| u.start_byte);
+    if !injections.is_empty() {
+        units.units.sort_by_key(|u| u.start_byte);
+    }
+    units
+}
+
+/// Extract code units from source code, auto-detecting language from file extension
+pub fn extract(path: &Path, source: &str) -> CodeUnits {
+    extract_file(path, source).0
+}
+
+pub fn extract_file(path: &Path, source: &str) -> (CodeUnits, ExtractedRefs) {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let Some(lang) = crate::languages::for_ext(ext) else {
+        return (CodeUnits::new(), ExtractedRefs::default());
+    };
+    let language: Language = (lang.grammar)().into();
+    let Some(tree) = parse(&language, source) else {
+        return (CodeUnits::new(), ExtractedRefs::default());
+    };
+    let injections = lang
+        .injections
+        .map(|query| parse_injections(query, &language, tree.root_node(), source))
+        .unwrap_or_default();
+    let units = units_of_tree(path, source, lang, tree.root_node(), &injections);
+    (units, refs_of_tree(source, tree.root_node(), &injections))
 }
 
 /// No-op code-unit extractor for config/data languages (YAML, JSON5).
@@ -196,109 +231,60 @@ pub fn extract_config(_path: &Path, _source: &str) -> CodeUnits {
     CodeUnits::new()
 }
 
+pub(crate) fn walk_config(_path: &Path, _source: &str, _root: Node, _units: &mut CodeUnits) {}
+
 /// Extract code units from Rust source code
 pub fn extract_rust(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_rust::language().into())
-        .expect("Failed to load Rust grammar");
+    units_with(path, source, arborium_rust::language, walk_rust)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-
-    // Walk the tree and extract code units
-    extract_units_recursive(path, source, root, &mut units, rust_node_kind);
-
-    units
+pub(crate) fn walk_rust(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, rust_node_kind);
 }
 
 /// Extract code units from Swift source code
 pub fn extract_swift(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_swift::language().into())
-        .expect("Failed to load Swift grammar");
+    units_with(path, source, arborium_swift::language, walk_swift)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, swift_node_kind);
-    units
+pub(crate) fn walk_swift(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, swift_node_kind);
 }
 
 /// Extract code units from Go source code
 pub fn extract_go(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_go::language().into())
-        .expect("Failed to load Go grammar");
+    units_with(path, source, arborium_go::language, walk_go)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, go_node_kind);
-    units
+pub(crate) fn walk_go(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, go_node_kind);
 }
 
 /// Extract code units from Java source code
 pub fn extract_java(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_java::language().into())
-        .expect("Failed to load Java grammar");
+    units_with(path, source, arborium_java::language, walk_java)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, java_node_kind);
-    units
+pub(crate) fn walk_java(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, java_node_kind);
 }
 
 /// Extract code units from Python source code
 pub fn extract_python(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_python::language().into())
-        .expect("Failed to load Python grammar");
+    units_with(path, source, arborium_python::language, walk_python)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, python_node_kind);
-    units
+pub(crate) fn walk_python(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, python_node_kind);
 }
 
 /// Extract code units from TypeScript source code
 pub fn extract_typescript(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_typescript::language().into())
-        .expect("Failed to load TypeScript grammar");
+    units_with(path, source, arborium_typescript::language, walk_typescript)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, typescript_node_kind);
-    units
+pub(crate) fn walk_typescript(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, typescript_node_kind);
 }
 
 // Language-specific node kind mappings
@@ -407,70 +393,38 @@ fn cpp_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from PHP source code
 pub fn extract_php(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_php::language().into())
-        .expect("Failed to load PHP grammar");
+    units_with(path, source, arborium_php::language, walk_php)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, php_node_kind);
-    units
+pub(crate) fn walk_php(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, php_node_kind);
 }
 
 /// Extract code units from C source code
 pub fn extract_c(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_c::language().into())
-        .expect("Failed to load C grammar");
+    units_with(path, source, arborium_c::language, walk_c)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, c_node_kind);
-    units
+pub(crate) fn walk_c(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, c_node_kind);
 }
 
 /// Extract code units from C++ source code
 pub fn extract_cpp(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_cpp::language().into())
-        .expect("Failed to load C++ grammar");
+    units_with(path, source, arborium_cpp::language, walk_cpp)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, cpp_node_kind);
-    units
+pub(crate) fn walk_cpp(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, cpp_node_kind);
 }
 
 /// Extract code units from Ruby source code
 pub fn extract_ruby(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_ruby::language().into())
-        .expect("Failed to load Ruby grammar");
+    units_with(path, source, arborium_ruby::language, walk_ruby)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, ruby_node_kind);
-    units
+pub(crate) fn walk_ruby(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, ruby_node_kind);
 }
 
 fn ruby_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -484,19 +438,11 @@ fn ruby_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from R source code
 pub fn extract_r(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_r::language().into())
-        .expect("Failed to load R grammar");
+    units_with(path, source, arborium_r::language, walk_r)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, r_node_kind);
-    units
+pub(crate) fn walk_r(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, r_node_kind);
 }
 
 fn r_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -508,19 +454,11 @@ fn r_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Dart source code
 pub fn extract_dart(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_dart::language().into())
-        .expect("Failed to load Dart grammar");
+    units_with(path, source, arborium_dart::language, walk_dart)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, dart_node_kind);
-    units
+pub(crate) fn walk_dart(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, dart_node_kind);
 }
 
 fn dart_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -536,19 +474,11 @@ fn dart_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Lua source code
 pub fn extract_lua(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_lua::language().into())
-        .expect("Failed to load Lua grammar");
+    units_with(path, source, arborium_lua::language, walk_lua)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, lua_node_kind);
-    units
+pub(crate) fn walk_lua(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, lua_node_kind);
 }
 
 fn lua_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -560,19 +490,11 @@ fn lua_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from assembly source code
 pub fn extract_asm(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_asm::language().into())
-        .expect("Failed to load ASM grammar");
+    units_with(path, source, arborium_asm::language, walk_asm)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, asm_node_kind);
-    units
+pub(crate) fn walk_asm(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, asm_node_kind);
 }
 
 fn asm_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -585,19 +507,11 @@ fn asm_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from MATLAB source code
 pub fn extract_matlab(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_matlab::language().into())
-        .expect("Failed to load MATLAB grammar");
+    units_with(path, source, arborium_matlab::language, walk_matlab)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, matlab_node_kind);
-    units
+pub(crate) fn walk_matlab(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, matlab_node_kind);
 }
 
 fn matlab_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -610,19 +524,11 @@ fn matlab_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Perl source code
 pub fn extract_perl(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_perl::language().into())
-        .expect("Failed to load Perl grammar");
+    units_with(path, source, arborium_perl::language, walk_perl)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, perl_node_kind);
-    units
+pub(crate) fn walk_perl(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, perl_node_kind);
 }
 
 fn perl_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -640,19 +546,11 @@ fn perl_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Haskell source code
 pub fn extract_haskell(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_haskell::language().into())
-        .expect("Failed to load Haskell grammar");
+    units_with(path, source, arborium_haskell::language, walk_haskell)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, haskell_node_kind);
-    units
+pub(crate) fn walk_haskell(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, haskell_node_kind);
 }
 
 fn haskell_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -672,19 +570,11 @@ fn haskell_node_kind(kind: &str) -> Option<CodeUnitKind> {
 /// Elixir uses `call` nodes with specific targets (def, defp, defmodule, etc.)
 /// rather than dedicated node types for definitions.
 pub fn extract_elixir(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_elixir::language().into())
-        .expect("Failed to load Elixir grammar");
+    units_with(path, source, arborium_elixir::language, walk_elixir)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_elixir_recursive(path, source, root, &mut units);
-    units
+pub(crate) fn walk_elixir(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_elixir_recursive(path, source, root, units);
 }
 
 fn elixir_call_kind(source: &str, node: Node) -> Option<CodeUnitKind> {
@@ -744,19 +634,11 @@ fn extract_elixir_recursive(path: &Path, source: &str, node: Node, units: &mut C
 
 /// Extract code units from Erlang source code
 pub fn extract_erlang(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_erlang::language().into())
-        .expect("Failed to load Erlang grammar");
+    units_with(path, source, arborium_erlang::language, walk_erlang)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, erlang_node_kind);
-    units
+pub(crate) fn walk_erlang(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, erlang_node_kind);
 }
 
 fn erlang_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -771,19 +653,11 @@ fn erlang_node_kind(kind: &str) -> Option<CodeUnitKind> {
 /// Clojure uses `list_lit` nodes where the first symbol determines the form type
 /// (defn, def, defmacro, ns, defprotocol, defrecord, deftype).
 pub fn extract_clojure(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_clojure::language().into())
-        .expect("Failed to load Clojure grammar");
+    units_with(path, source, arborium_clojure::language, walk_clojure)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_clojure_recursive(path, source, root, &mut units);
-    units
+pub(crate) fn walk_clojure(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_clojure_recursive(path, source, root, units);
 }
 
 fn clojure_list_kind(source: &str, node: Node) -> Option<CodeUnitKind> {
@@ -845,19 +719,11 @@ fn extract_clojure_recursive(path: &Path, source: &str, node: Node, units: &mut 
 
 /// Extract code units from F# source code
 pub fn extract_fsharp(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_fsharp::language().into())
-        .expect("Failed to load F# grammar");
+    units_with(path, source, arborium_fsharp::language, walk_fsharp)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, fsharp_node_kind);
-    units
+pub(crate) fn walk_fsharp(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, fsharp_node_kind);
 }
 
 fn fsharp_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -871,19 +737,11 @@ fn fsharp_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Visual Basic source code
 pub fn extract_vb(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_vb::language().into())
-        .expect("Failed to load Visual Basic grammar");
+    units_with(path, source, arborium_vb::language, walk_vb)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, vb_node_kind);
-    units
+pub(crate) fn walk_vb(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, vb_node_kind);
 }
 
 fn vb_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -898,19 +756,11 @@ fn vb_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from COBOL source code
 pub fn extract_cobol(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_cobol::language().into())
-        .expect("Failed to load COBOL grammar");
+    units_with(path, source, arborium_cobol::language, walk_cobol)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, cobol_node_kind);
-    units
+pub(crate) fn walk_cobol(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, cobol_node_kind);
 }
 
 fn cobol_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -923,19 +773,11 @@ fn cobol_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Julia source code
 pub fn extract_julia(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_julia::language().into())
-        .expect("Failed to load Julia grammar");
+    units_with(path, source, arborium_julia::language, walk_julia)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, julia_node_kind);
-    units
+pub(crate) fn walk_julia(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, julia_node_kind);
 }
 
 fn julia_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -952,19 +794,11 @@ fn julia_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from D source code
 pub fn extract_d(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_d::language().into())
-        .expect("Failed to load D grammar");
+    units_with(path, source, arborium_d::language, walk_d)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, d_node_kind);
-    units
+pub(crate) fn walk_d(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, d_node_kind);
 }
 
 fn d_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -979,19 +813,11 @@ fn d_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from PowerShell source code
 pub fn extract_powershell(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_powershell::language().into())
-        .expect("Failed to load PowerShell grammar");
+    units_with(path, source, arborium_powershell::language, walk_powershell)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, powershell_node_kind);
-    units
+pub(crate) fn walk_powershell(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, powershell_node_kind);
 }
 
 fn powershell_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -1005,19 +831,11 @@ fn powershell_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from CMake source code
 pub fn extract_cmake(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_cmake::language().into())
-        .expect("Failed to load CMake grammar");
+    units_with(path, source, arborium_cmake::language, walk_cmake)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, cmake_node_kind);
-    units
+pub(crate) fn walk_cmake(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, cmake_node_kind);
 }
 
 fn cmake_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -1030,19 +848,11 @@ fn cmake_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from OCaml source code
 pub fn extract_ocaml(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_ocaml::language().into())
-        .expect("Failed to load OCaml grammar");
+    units_with(path, source, arborium_ocaml::language, walk_ocaml)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, ocaml_node_kind);
-    units
+pub(crate) fn walk_ocaml(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, ocaml_node_kind);
 }
 
 fn ocaml_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -1056,19 +866,11 @@ fn ocaml_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Bash source code
 pub fn extract_bash(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_bash::language().into())
-        .expect("Failed to load Bash grammar");
+    units_with(path, source, arborium_bash::language, walk_bash)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, bash_node_kind);
-    units
+pub(crate) fn walk_bash(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, bash_node_kind);
 }
 
 fn bash_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -1080,19 +882,11 @@ fn bash_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Nix source code
 pub fn extract_nix(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_nix::language().into())
-        .expect("Failed to load Nix grammar");
+    units_with(path, source, arborium_nix::language, walk_nix)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, nix_node_kind);
-    units
+pub(crate) fn walk_nix(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, nix_node_kind);
 }
 
 fn nix_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -1105,19 +899,11 @@ fn nix_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Lean source code
 pub fn extract_lean(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_lean::language().into())
-        .expect("Failed to load Lean grammar");
+    units_with(path, source, arborium_lean::language, walk_lean)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, lean_node_kind);
-    units
+pub(crate) fn walk_lean(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, lean_node_kind);
 }
 
 fn lean_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -1134,19 +920,11 @@ fn lean_node_kind(kind: &str) -> Option<CodeUnitKind> {
 
 /// Extract code units from Svelte source code
 pub fn extract_svelte(path: &Path, source: &str) -> CodeUnits {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&arborium_svelte::language().into())
-        .expect("Failed to load Svelte grammar");
+    units_with(path, source, arborium_svelte::language, walk_svelte)
+}
 
-    let Some(tree) = parser.parse(source, None) else {
-        return CodeUnits::new();
-    };
-
-    let mut units = CodeUnits::new();
-    let root = tree.root_node();
-    extract_units_recursive(path, source, root, &mut units, svelte_node_kind);
-    units
+pub(crate) fn walk_svelte(path: &Path, source: &str, root: Node, units: &mut CodeUnits) {
+    extract_units_recursive(path, source, root, units, svelte_node_kind);
 }
 
 fn svelte_node_kind(kind: &str) -> Option<CodeUnitKind> {
@@ -1533,23 +1311,24 @@ pub fn extract_refs_with_warnings(path: &Path, source: &str) -> ExtractedRefs {
         return ExtractedRefs::default();
     };
     let language: Language = (lang.grammar)().into();
-
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language)
-        .expect("Failed to load grammar");
-
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(tree) = parse(&language, source) else {
         return ExtractedRefs::default();
     };
     let injections = lang
         .injections
         .map(|query| parse_injections(query, &language, tree.root_node(), source))
         .unwrap_or_default();
+    refs_of_tree(source, tree.root_node(), &injections)
+}
 
+fn refs_of_tree(
+    source: &str,
+    root: Node,
+    injections: &[crate::injections::Injection],
+) -> ExtractedRefs {
     let mut comments = Vec::new();
-    collect_comment_nodes(tree.root_node(), &mut comments);
-    for injection in &injections {
+    collect_comment_nodes(root, &mut comments);
+    for injection in injections {
         collect_comment_nodes(injection.tree.root_node(), &mut comments);
     }
     // Ignore directives apply in file order, and the host and each injected region are separate trees.
@@ -1933,7 +1712,12 @@ fn try_parse_full_ref(
 fn try_parse_req_ref(
     chars: &mut std::iter::Peekable<impl Iterator<Item = (usize, char)>>,
 ) -> Option<RuleId> {
-    let Some(ParsedFullRef::Parsed { verb: _, req_id, end_idx: _ }) = try_parse_full_ref(chars) else {
+    let Some(ParsedFullRef::Parsed {
+        verb: _,
+        req_id,
+        end_idx: _,
+    }) = try_parse_full_ref(chars)
+    else {
         return None;
     };
     Some(req_id)

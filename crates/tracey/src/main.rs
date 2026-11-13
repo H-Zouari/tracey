@@ -329,8 +329,7 @@ impl ValidationDeny {
 // Embed the config schema for zero-execution discovery by styx tooling
 styx_embed::embed_outdir_file!("schema.styx");
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.first().map(|s| s.as_str()) == Some("mcp")
         && raw_args.get(1).map(|s| s.as_str()) == Some("register")
@@ -348,6 +347,17 @@ async fn main() -> Result<()> {
         .build();
     let args: Args = args::Driver::new(config).run().unwrap();
 
+    let mut runtime = match args.command {
+        Command::Web { .. }
+        | Command::Mcp { .. }
+        | Command::Lsp { .. }
+        | Command::Daemon { .. } => tokio::runtime::Builder::new_multi_thread(),
+        _ => tokio::runtime::Builder::new_current_thread(),
+    };
+    runtime.enable_all().build()?.block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<()> {
     match args.command {
         // r[impl cli.web]
         // r[impl daemon.cli.web]

@@ -178,7 +178,7 @@ impl Engine {
         // Build initial data. If config is semantically invalid, keep daemon alive
         // with an empty config and surface the error through health/LSP diagnostics.
         let overlay = FileOverlay::new();
-        let mut build_cache = BuildCache::default();
+        let mut build_cache = BuildCache::on_disk(&project_root);
         let data = match build_dashboard_data_with_overlay_and_cache(
             &project_root,
             &config_path,
@@ -210,6 +210,7 @@ impl Engine {
                 .await?
             }
         };
+        build_cache.persist();
         let data = Arc::new(data);
 
         // Create watch channel for broadcasting updates
@@ -530,6 +531,7 @@ impl Engine {
             changed_files,
         )
         .await;
+        build_cache.persist();
         let new_data = match build_result {
             Ok(data) => Arc::new(data),
             Err(e) => {

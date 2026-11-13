@@ -29,6 +29,7 @@ name = "tracey"
 path = "src/main.rs"
 
 [dependencies]
+rayon = { workspace = true }
 tracey-core = { workspace = true, features = ["walk", "parallel", "reverse"] }
 tracey-api = { workspace = true }
 tracey-proto = { workspace = true }
@@ -64,7 +65,7 @@ arborium = { workspace = true }
 
 # HTTP server for serve command
 axum = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tower-http = { workspace = true }
 hyper-util = { workspace = true }
 futures-util = { workspace = true }

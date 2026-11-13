@@ -189,7 +189,23 @@ pub(crate) fn extract_from_content(path: &Path, content: &str, reqs: &mut Reqs) 
         // r[impl ref.comments.line]
         // r[impl ref.comments.doc]
         // r[impl ref.comments.block]
-        let extracted = crate::code_units::extract_refs_with_warnings(path, content);
+        reqs.extend(Reqs::from_extracted(
+            path,
+            crate::code_units::extract_refs_with_warnings(path, content),
+        ));
+    }
+
+    #[cfg(not(feature = "reverse"))]
+    {
+        // Fallback: text-based scanning
+        extract_from_content_text_based(path, content, reqs);
+    }
+}
+
+#[cfg(feature = "reverse")]
+impl Reqs {
+    pub fn from_extracted(path: &Path, extracted: crate::code_units::ExtractedRefs) -> Self {
+        let mut reqs = Reqs::new();
         for full_ref in extracted.references {
             let verb = match full_ref.verb.as_str() {
                 "define" => RefVerb::Define,
@@ -216,12 +232,7 @@ pub(crate) fn extract_from_content(path: &Path, content: &str, reqs: &mut Reqs) 
                 kind: WarningKind::MalformedReference,
             });
         }
-    }
-
-    #[cfg(not(feature = "reverse"))]
-    {
-        // Fallback: text-based scanning
-        extract_from_content_text_based(path, content, reqs);
+        reqs
     }
 }
 
@@ -1178,7 +1189,11 @@ pub fn reconnect() {}
         // /* */ is not valid YAML comment syntax; must not be parsed as one.
         let content = "/* r[impl yaml.false-positive] */\n";
         let reqs = Reqs::extract_from_content(Path::new("config.yml"), content);
-        assert_eq!(reqs.len(), 0, "/* */ should not be treated as a comment in YAML");
+        assert_eq!(
+            reqs.len(),
+            0,
+            "/* */ should not be treated as a comment in YAML"
+        );
     }
 
     #[test]
@@ -1186,7 +1201,11 @@ pub fn reconnect() {}
         // '#' embedded in a plain scalar (no preceding whitespace) is not a comment.
         let content = "url: https://example.com/#frag r[impl should.not.parse]\n";
         let reqs = Reqs::extract_from_content(Path::new("config.yaml"), content);
-        assert_eq!(reqs.len(), 0, "# inside a scalar value must not be treated as a comment");
+        assert_eq!(
+            reqs.len(),
+            0,
+            "# inside a scalar value must not be treated as a comment"
+        );
     }
 
     #[test]
@@ -1203,6 +1222,10 @@ pub fn reconnect() {}
         // '#' inside a quoted string is not a comment.
         let content = "msg: \"hello # r[impl yaml.false-positive]\"\n";
         let reqs = Reqs::extract_from_content(Path::new("config.yaml"), content);
-        assert_eq!(reqs.len(), 0, "# inside a double-quoted scalar must not be a comment");
+        assert_eq!(
+            reqs.len(),
+            0,
+            "# inside a double-quoted scalar must not be a comment"
+        );
     }
 }

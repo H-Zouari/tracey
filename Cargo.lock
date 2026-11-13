@@ -5959,6 +5959,7 @@ dependencies = [
  "notify",
  "open",
  "owo-colors",
+ "rayon",
  "rust-mcp-sdk",
  "serde",
  "serde_json",

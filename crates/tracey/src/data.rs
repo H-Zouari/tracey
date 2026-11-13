@@ -39,8 +39,8 @@ use crate::search;
 // Re-export API types from tracey-api crate
 pub use tracey_api::{
     ApiCodeRef, ApiCodeUnit, ApiConfig, ApiFileData, ApiFileEntry, ApiForwardData, ApiReverseData,
-    ApiRule, ApiSpecData, ApiSpecForward, ApiSpecInfo, ApiStaleRef, OutlineCoverage,
-    OutlineEntry, SpecSection, ValidationError, ValidationErrorCode, ValidationResult,
+    ApiRule, ApiSpecData, ApiSpecForward, ApiSpecInfo, ApiStaleRef, OutlineCoverage, OutlineEntry,
+    SpecSection, ValidationError, ValidationErrorCode, ValidationResult,
 };
 use tracey_proto::{LspDiagnostic, LspFileDiagnostics};
 
@@ -89,12 +89,49 @@ pub struct DashboardData {
     pub test_files: std::collections::HashSet<PathBuf>,
 }
 
+mod disk_cache;
+
 #[derive(Default)]
 pub struct BuildCache {
     source_files: HashMap<PathBuf, CachedSourceFile>,
     impl_scan_paths: HashMap<ImplScanKey, CachedScanPaths>,
     spec_scan_paths: HashMap<SpecScanKey, CachedScanPaths>,
     spec_files: HashMap<PathBuf, CachedSpecFile>,
+    on_disk: Option<OnDisk>,
+}
+
+struct OnDisk {
+    root: PathBuf,
+    unclaimed: HashMap<PathBuf, disk_cache::ParsedSource>,
+    stale: bool,
+}
+
+impl BuildCache {
+    pub fn on_disk(project_root: &Path) -> Self {
+        let unclaimed = disk_cache::load(project_root);
+        Self {
+            on_disk: Some(OnDisk {
+                root: project_root.to_path_buf(),
+                stale: unclaimed.is_empty(),
+                unclaimed,
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub fn persist(&mut self) {
+        let Some(on_disk) = &mut self.on_disk else {
+            return;
+        };
+        if !on_disk.stale && on_disk.unclaimed.is_empty() {
+            return;
+        }
+        if let Err(error) = disk_cache::save(&on_disk.root, &self.source_files) {
+            tracing::debug!("could not write the parse cache: {error}");
+        }
+        on_disk.unclaimed.clear();
+        on_disk.stale = false;
+    }
 }
 
 #[derive(Clone)]
@@ -391,7 +428,8 @@ async fn read_file_with_overlay(path: &Path, overlay: &FileOverlay) -> std::io::
         return Ok(content.clone());
     }
     // Try canonicalized path too
-    if let Ok(canonical) = path.canonicalize()
+    if !overlay.is_empty()
+        && let Ok(canonical) = path.canonicalize()
         && let Some(content) = overlay.get(&canonical)
     {
         return Ok(content.clone());
@@ -411,12 +449,43 @@ fn compute_content_hash(content: &str) -> u64 {
     simple_hash(content)
 }
 
-async fn get_cached_source_file(
+enum SourceLookup {
+    Cached(CachedSourceFile),
+    Unparsed(UnparsedSourceFile),
+}
+
+struct UnparsedSourceFile {
+    canonical: PathBuf,
+    content: String,
+    content_hash: u64,
+    file_len: u64,
+    modified_nanos: Option<u128>,
+}
+
+impl UnparsedSourceFile {
+    fn parse(self) -> (PathBuf, CachedSourceFile) {
+        let (units, extracted) =
+            tracey_core::code_units::extract_file(&self.canonical, &self.content);
+        let reqs = Reqs::from_extracted(&self.canonical, extracted);
+        let parsed = CachedSourceFile {
+            content_hash: self.content_hash,
+            file_len: self.file_len,
+            modified_nanos: self.modified_nanos,
+            content: self.content,
+            refs: reqs.references,
+            parse_warnings: reqs.warnings,
+            code_units: units.units,
+        };
+        (self.canonical, parsed)
+    }
+}
+
+async fn lookup_source_file(
     path: &Path,
     overlay: &FileOverlay,
     cache: &mut BuildCache,
     stats: &mut CacheStats,
-) -> std::io::Result<CachedSourceFile> {
+) -> std::io::Result<SourceLookup> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
     let overlay_content = overlay
@@ -430,24 +499,18 @@ async fn get_cached_source_file(
             && entry.content_hash == content_hash
         {
             stats.hash_hits += 1;
-            return Ok(entry.clone());
+            return Ok(SourceLookup::Cached(entry.clone()));
         }
-
-        let reqs = Reqs::extract_from_content(&canonical, &content);
-        let code_units = tracey_core::code_units::extract(&canonical, &content).units;
-        let parsed = CachedSourceFile {
-            content_hash,
-            file_len: content.len() as u64,
-            modified_nanos: None,
-            content,
-            refs: reqs.references,
-            parse_warnings: reqs.warnings,
-            code_units,
-        };
         stats.misses += 1;
         stats.reparsed += 1;
-        cache.source_files.insert(canonical, parsed.clone());
-        return Ok(parsed);
+        let file_len = content.len() as u64;
+        return Ok(SourceLookup::Unparsed(UnparsedSourceFile {
+            canonical,
+            content,
+            content_hash,
+            file_len,
+            modified_nanos: None,
+        }));
     }
 
     let metadata = tokio::fs::metadata(&canonical).await?;
@@ -459,7 +522,7 @@ async fn get_cached_source_file(
         && entry.modified_nanos == modified_nanos
     {
         stats.metadata_hits += 1;
-        return Ok(entry.clone());
+        return Ok(SourceLookup::Cached(entry.clone()));
     }
 
     let content = read_file_with_overlay(&canonical, overlay).await?;
@@ -473,24 +536,36 @@ async fn get_cached_source_file(
         updated.modified_nanos = modified_nanos;
         cache.source_files.insert(canonical, updated.clone());
         stats.hash_hits += 1;
-        return Ok(updated);
+        return Ok(SourceLookup::Cached(updated));
     }
 
-    let reqs = Reqs::extract_from_content(&canonical, &content);
-    let code_units = tracey_core::code_units::extract(&canonical, &content).units;
-    let parsed = CachedSourceFile {
+    if let Some(on_disk) = &mut cache.on_disk
+        && let Some(parsed) = on_disk.unclaimed.remove(&canonical)
+        && parsed.content_hash == content_hash
+    {
+        let file = CachedSourceFile {
+            content_hash,
+            file_len,
+            modified_nanos,
+            content,
+            refs: parsed.refs,
+            parse_warnings: parsed.parse_warnings,
+            code_units: parsed.code_units,
+        };
+        cache.source_files.insert(canonical, file.clone());
+        stats.hash_hits += 1;
+        return Ok(SourceLookup::Cached(file));
+    }
+
+    stats.misses += 1;
+    stats.reparsed += 1;
+    Ok(SourceLookup::Unparsed(UnparsedSourceFile {
+        canonical,
+        content,
         content_hash,
         file_len,
         modified_nanos,
-        content,
-        refs: reqs.references,
-        parse_warnings: reqs.warnings,
-        code_units,
-    };
-    stats.misses += 1;
-    stats.reparsed += 1;
-    cache.source_files.insert(canonical, parsed.clone());
-    Ok(parsed)
+    }))
 }
 
 #[derive(Clone)]
@@ -501,6 +576,25 @@ struct ScanRootPattern {
     /// this form.
     base: PathBuf,
     matcher: globset::GlobMatcher,
+    exact_file: bool,
+}
+
+impl ScanRootPattern {
+    fn walk(&self) -> ignore::Walk {
+        project_walker(&self.root)
+            .max_depth(self.exact_file.then_some(1))
+            .build()
+    }
+}
+
+fn project_walker(root: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .follow_links(true)
+        .hidden(false)
+        .git_ignore(true)
+        .filter_entry(|entry| entry.file_name() != ".git");
+    builder
 }
 
 /// Split a glob pattern into (directory_prefix, glob_suffix).
@@ -538,6 +632,7 @@ fn build_scan_roots(
             matcher: globset::Glob::new("**/*")
                 .expect("valid glob")
                 .compile_matcher(),
+            exact_file: false,
         });
         return (roots, warnings);
     }
@@ -563,7 +658,8 @@ fn build_scan_roots(
 
         // For exact-file patterns (e.g. "justfile"), anchor at parent and match file name.
         // For exact-directory patterns, match everything under the directory.
-        let effective_glob = if glob_suffix.is_empty() && resolved_root.is_file() {
+        let exact_file = glob_suffix.is_empty() && resolved_root.is_file();
+        let effective_glob = if exact_file {
             let file_name = match resolved_root.file_name() {
                 Some(name) => name.to_string_lossy().to_string(),
                 None => {
@@ -607,6 +703,7 @@ fn build_scan_roots(
             root: resolved_root,
             base,
             matcher,
+            exact_file,
         });
     }
 
@@ -703,13 +800,7 @@ fn full_walk_for_roots(
     let mut out = BTreeSet::new();
     let mut legacy_excludes: BTreeSet<(String, PathBuf)> = BTreeSet::new();
     for root_pattern in roots {
-        let walker = ignore::WalkBuilder::new(&root_pattern.root)
-            .follow_links(true)
-            .hidden(false)
-            .git_ignore(true)
-            .build();
-
-        for entry in walker.flatten() {
+        for entry in root_pattern.walk().flatten() {
             let path = entry.path();
             let Some(ft) = entry.file_type() else {
                 continue;
@@ -1000,24 +1091,52 @@ async fn scan_impl_files(
     let mut code_units_by_file: BTreeMap<PathBuf, Vec<CodeUnit>> = BTreeMap::new();
     let mut file_contents: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut reqs_by_file: BTreeMap<PathBuf, Reqs> = BTreeMap::new();
+    let mut looked_up: Vec<(PathBuf, Result<SourceLookup, String>)> = Vec::new();
     for path in files {
-        match path.extension() {
-            Some(ext) if is_supported_extension(ext) => {}
-            Some(ext) => {
-                parse_failures.push((
-                    path.clone(),
-                    format!("unsupported file extension '.{}'", ext.to_string_lossy()),
-                ));
-                continue;
+        let found = match path.extension() {
+            Some(ext) if is_supported_extension(ext) => {
+                lookup_source_file(&path, overlay, cache, stats)
+                    .await
+                    .map_err(|err| format!("failed to read/parse file: {err}"))
             }
-            None => {
-                parse_failures.push((path.clone(), "file has no extension".to_string()));
-                continue;
-            }
+            Some(ext) => Err(format!(
+                "unsupported file extension '.{}'",
+                ext.to_string_lossy()
+            )),
+            None => Err("file has no extension".to_string()),
+        };
+        looked_up.push((path, found));
+    }
+    let scanned: Vec<(PathBuf, Result<(Option<PathBuf>, CachedSourceFile), String>)> = {
+        use rayon::prelude::*;
+        let resolve = |(path, found): (PathBuf, Result<SourceLookup, String>)| {
+            let file = found.map(|lookup| match lookup {
+                SourceLookup::Cached(file) => (None, file),
+                SourceLookup::Unparsed(unparsed) => {
+                    let (canonical, file) = unparsed.parse();
+                    (Some(canonical), file)
+                }
+            });
+            (path, file)
+        };
+        if looked_up
+            .iter()
+            .any(|(_, found)| matches!(found, Ok(SourceLookup::Unparsed(_))))
+        {
+            looked_up.into_par_iter().map(resolve).collect()
+        } else {
+            looked_up.into_iter().map(resolve).collect()
         }
-
-        match get_cached_source_file(&path, overlay, cache, stats).await {
-            Ok(parsed) => {
+    };
+    for (path, file) in scanned {
+        match file {
+            Ok((fresh, parsed)) => {
+                if let Some(canonical) = fresh {
+                    cache.source_files.insert(canonical, parsed.clone());
+                    if let Some(on_disk) = &mut cache.on_disk {
+                        on_disk.stale = true;
+                    }
+                }
                 reqs_by_file.insert(
                     path.clone(),
                     Reqs {
@@ -1032,9 +1151,7 @@ async fn scan_impl_files(
                 }
                 file_contents.insert(path, parsed.content);
             }
-            Err(err) => {
-                parse_failures.push((path, format!("failed to read/parse file: {err}")));
-            }
+            Err(message) => parse_failures.push((path, message)),
         }
     }
     (
@@ -1210,34 +1327,58 @@ fn detect_circular_dependencies(forward_data: &ApiSpecForward) -> Vec<Vec<RuleId
     cycles
 }
 
-fn span_to_range(content: &str, offset: usize, length: usize) -> (u32, u32, u32, u32) {
-    let mut line = 0u32;
-    let mut col = 0u32;
-    let mut start_line = 0u32;
-    let mut start_col = 0u32;
-    let mut found_start = false;
+struct LineIndex<'a> {
+    content: &'a str,
+    line_starts: std::cell::OnceCell<Vec<usize>>,
+}
 
-    for (i, c) in content.char_indices() {
-        if i == offset {
-            start_line = line;
-            start_col = col;
-            found_start = true;
-        }
-        if i == offset + length {
-            return (start_line, start_col, line, col);
-        }
-        if c == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
+impl<'a> LineIndex<'a> {
+    fn new(content: &'a str) -> Self {
+        LineIndex {
+            content,
+            line_starts: std::cell::OnceCell::new(),
         }
     }
 
-    if !found_start {
-        (line, col, line, col)
-    } else {
-        (start_line, start_col, line, col)
+    fn line_starts(&self) -> &[usize] {
+        self.line_starts.get_or_init(|| {
+            std::iter::once(0)
+                .chain(
+                    self.content
+                        .bytes()
+                        .enumerate()
+                        .filter(|(_, byte)| *byte == b'\n')
+                        .map(|(i, _)| i + 1),
+                )
+                .collect()
+        })
+    }
+
+    fn position(&self, offset: usize) -> (u32, u32) {
+        let line_starts = self.line_starts();
+        let line = line_starts.partition_point(|&start| start <= offset) - 1;
+        let column = self.content[line_starts[line]..offset].chars().count();
+        (line as u32, column as u32)
+    }
+
+    fn character_at(&self, offset: usize) -> Option<(u32, u32)> {
+        (offset < self.content.len() && self.content.is_char_boundary(offset))
+            .then(|| self.position(offset))
+    }
+
+    fn range(&self, offset: usize, length: usize) -> (u32, u32, u32, u32) {
+        let end_of_file = self.position(self.content.len());
+        match (
+            self.character_at(offset),
+            self.character_at(offset.saturating_add(length)),
+        ) {
+            (start, Some(end)) => {
+                let (start_line, start_char) = start.unwrap_or((0, 0));
+                (start_line, start_char, end.0, end.1)
+            }
+            (Some(start), None) => (start.0, start.1, end_of_file.0, end_of_file.1),
+            (None, None) => (end_of_file.0, end_of_file.1, end_of_file.0, end_of_file.1),
+        }
     }
 }
 
@@ -1313,10 +1454,11 @@ fn collect_source_diagnostic_issues(
     }
 
     let mut diagnostics = Vec::new();
+    let lines = LineIndex::new(content);
 
     for reference in &reqs.references {
         let (start_line, start_char, end_line, end_char) =
-            span_to_range(content, reference.span.offset, reference.span.length);
+            lines.range(reference.span.offset, reference.span.length);
 
         if !ctx.known_prefixes.contains(reference.prefix.as_str()) {
             if !source_reference_uses_explicit_verb(
@@ -1438,7 +1580,7 @@ fn collect_source_diagnostic_issues(
 
     for warning in &reqs.warnings {
         let (start_line, start_char, end_line, end_char) =
-            span_to_range(content, warning.span.offset, warning.span.length);
+            lines.range(warning.span.offset, warning.span.length);
         let message = match &warning.kind {
             tracey_core::WarningKind::UnknownVerb(verb) => {
                 format!("Unknown verb: '{}'", verb)
@@ -1486,16 +1628,13 @@ fn source_issue_to_lsp(issue: SourceDiagnosticIssue) -> LspDiagnostic {
 fn compute_validation_by_impl(
     abs_root: &Path,
     config_path: &Path,
-    config: &ApiConfig,
     forward_by_impl: &BTreeMap<ImplKey, ApiSpecForward>,
     source_files_by_impl: &BTreeMap<ImplKey, BTreeSet<PathBuf>>,
     source_reqs_by_file: &BTreeMap<PathBuf, Reqs>,
-    file_contents: &BTreeMap<PathBuf, String>,
-    test_files: &std::collections::HashSet<PathBuf>,
+    source_issues: &BTreeMap<PathBuf, Vec<SourceDiagnosticIssue>>,
     include_parse_failures_by_impl: &BTreeMap<ImplKey, BTreeMap<PathBuf, String>>,
 ) -> BTreeMap<ImplKey, ValidationResult> {
     let mut out = BTreeMap::new();
-    let source_ctx = build_source_diagnostic_context(config, forward_by_impl);
 
     for (impl_key, forward_data) in forward_by_impl {
         let (spec, impl_name) = impl_key;
@@ -1580,7 +1719,7 @@ fn compute_validation_by_impl(
                 if reqs.references.is_empty() {
                     continue;
                 }
-                let Some(content) = file_contents.get(path) else {
+                let Some(issues) = source_issues.get(path) else {
                     continue;
                 };
                 let rel_path = path
@@ -1588,9 +1727,7 @@ fn compute_validation_by_impl(
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| compute_relative_path(abs_root, path));
 
-                let is_test = test_files.contains(path);
-                let issues = collect_source_diagnostic_issues(content, reqs, is_test, &source_ctx);
-                for issue in issues {
+                for issue in issues.clone() {
                     let (code, related_rules) = match issue.code {
                         SourceDiagnosticIssueCode::UnknownPrefix => {
                             (ValidationErrorCode::UnknownPrefix, Vec::new())
@@ -1725,22 +1862,20 @@ async fn compute_workspace_diagnostics(
     config: &ApiConfig,
     forward_by_impl: &BTreeMap<ImplKey, ApiSpecForward>,
     source_reqs_by_file: &BTreeMap<PathBuf, Reqs>,
-    file_contents: &BTreeMap<PathBuf, String>,
     spec_file_contents: &BTreeMap<PathBuf, String>,
-    test_files: &std::collections::HashSet<PathBuf>,
+    source_issues: &BTreeMap<PathBuf, Vec<SourceDiagnosticIssue>>,
     include_parse_failures: &BTreeMap<PathBuf, String>,
 ) -> Vec<LspFileDiagnostics> {
     let mut out = Vec::new();
 
     // Source file diagnostics
-    let source_ctx = build_source_diagnostic_context(config, forward_by_impl);
-    for (path, reqs) in source_reqs_by_file {
-        let Some(content) = file_contents.get(path) else {
+    for path in source_reqs_by_file.keys() {
+        let Some(issues) = source_issues.get(path) else {
             continue;
         };
-        let is_test = test_files.contains(path);
-        let diagnostics = collect_source_diagnostic_issues(content, reqs, is_test, &source_ctx)
-            .into_iter()
+        let diagnostics = issues
+            .iter()
+            .cloned()
             .map(source_issue_to_lsp)
             .collect::<Vec<_>>();
 
@@ -1868,9 +2003,10 @@ async fn compute_spec_file_diagnostics(
         // Coverage diagnostics: parse the spec doc to get requirement definitions
         let fmt = SpecFormat::from_path(path).unwrap_or(SpecFormat::Markdown);
         if let Ok(doc) = parse_spec(fmt, content).await {
+            let lines = LineIndex::new(content);
             for def in &doc.reqs {
                 let (start_line, start_char, end_line, end_char) =
-                    span_to_range(content, def.marker_span.offset, def.marker_span.length);
+                    lines.range(def.marker_span.offset, def.marker_span.length);
 
                 if let Some(rule_id) = parse_rule_id(&def.id.to_string()) {
                     // Find the rule across all impls to check coverage
@@ -1923,7 +2059,7 @@ async fn compute_spec_file_diagnostics(
                     continue;
                 };
                 let (start_line, start_char, end_line, end_char) =
-                    span_to_range(content, code_span.span.offset, code_span.span.length);
+                    lines.range(code_span.span.offset, code_span.span.length);
 
                 if !known_prefixes.contains(prefix.as_str()) {
                     diagnostics.push(LspDiagnostic {
@@ -2045,16 +2181,22 @@ fn compute_impl_output(
     }
     let mut indexed_refs: Vec<IndexedRef> = Vec::new();
     let mut refs_by_base: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut relative_by_file: HashMap<&Path, String> = HashMap::new();
     for r in &refs {
         if r.prefix != inferred_prefix {
             continue;
         }
-        let canonical_ref = r.file.canonicalize().unwrap_or_else(|_| r.file.clone());
-        let relative_display = if let Ok(rel) = canonical_ref.strip_prefix(abs_root) {
-            rel.display().to_string()
-        } else {
-            compute_relative_path(abs_root, &canonical_ref)
-        };
+        let relative_display = relative_by_file
+            .entry(r.file.as_path())
+            .or_insert_with(|| {
+                let canonical_ref = r.file.canonicalize().unwrap_or_else(|_| r.file.clone());
+                if let Ok(rel) = canonical_ref.strip_prefix(abs_root) {
+                    rel.display().to_string()
+                } else {
+                    compute_relative_path(abs_root, &canonical_ref)
+                }
+            })
+            .clone();
         let idx = indexed_refs.len();
         indexed_refs.push(IndexedRef {
             verb: r.verb,
@@ -2337,12 +2479,7 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
             // r[impl config.impl.exclude]
             let (roots, _) = build_scan_roots(project_root, &impl_config.test_include);
             for root_pattern in &roots {
-                let walker = ignore::WalkBuilder::new(&root_pattern.root)
-                    .follow_links(true)
-                    .hidden(false)
-                    .git_ignore(true)
-                    .build();
-                for entry in walker.flatten() {
+                for entry in root_pattern.walk().flatten() {
                     if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                         continue;
                     }
@@ -2703,15 +2840,27 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
         content_hash ^= simple_hash(&format!("{:?}:{}", key, json));
     }
 
+    let source_ctx = build_source_diagnostic_context(&api_config, &forward_by_impl);
+    let source_issues: BTreeMap<PathBuf, Vec<SourceDiagnosticIssue>> = all_source_reqs_by_file
+        .iter()
+        .filter_map(|(path, reqs)| {
+            let content = all_file_contents.get(path)?;
+            let issues = collect_source_diagnostic_issues(
+                content,
+                reqs,
+                test_files.contains(path),
+                &source_ctx,
+            );
+            Some((path.clone(), issues))
+        })
+        .collect();
     let validation_by_impl = compute_validation_by_impl(
         &abs_root,
         config_path,
-        &api_config,
         &forward_by_impl,
         &source_files_by_impl,
         &all_source_reqs_by_file,
-        &all_file_contents,
-        &test_files,
+        &source_issues,
         &include_parse_failures_by_impl,
     );
     let workspace_diagnostics = compute_workspace_diagnostics(
@@ -2720,9 +2869,8 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
         &api_config,
         &forward_by_impl,
         &all_source_reqs_by_file,
-        &all_file_contents,
         &all_spec_file_contents,
-        &test_files,
+        &source_issues,
         &include_parse_failures,
     )
     .await;
@@ -2803,8 +2951,6 @@ async fn load_spec_content(
     overlay: &FileOverlay,
     spec_file_deps: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<()> {
-    use ignore::WalkBuilder;
-
     // The diagram / code-block handler chain is constant and now lives in the
     // markdown backend; only the inline-code handler depends on caller data
     // (spec/impl names for cross-spec link URLs).
@@ -2830,13 +2976,7 @@ async fn load_spec_content(
     // Collect all matching files with their content, weight, and format
     let mut files: Vec<(String, String, i32, SpecFormat)> = Vec::new();
 
-    let walker = WalkBuilder::new(root)
-        .follow_links(true)
-        .hidden(false)
-        .git_ignore(true)
-        .build();
-
-    for entry in walker.flatten() {
+    for entry in project_walker(root).build().flatten() {
         let path = entry.path();
 
         let Some(fmt) = SpecFormat::from_path(path) else {
